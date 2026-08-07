@@ -1,0 +1,17 @@
+{
+  "name": "machine-detect",
+  "version": "1.0.0",
+  "description": "Outbound call + Vonage Advanced Machine Detection, transfer on machine",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

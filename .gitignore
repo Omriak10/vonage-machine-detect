@@ -1,0 +1,15 @@
+# secrets & deployment-specific config - never commit
+.env
+vcr.yml
+private.key
+public.key
+*.pem
+
+# dependencies & build
+node_modules/
+.vcr/
+npm-debug.log*
+
+# runtime
+*.wav
+drop-message.wav
