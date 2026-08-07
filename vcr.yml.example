@@ -1,0 +1,25 @@
+# Rename to vcr.yml and fill in your own application id + env before `vcr deploy`.
+project:
+    name: machine-detect
+instance:
+    name: production
+    runtime: nodejs22
+    region: aws.euw1
+    application-id: 00000000-0000-0000-0000-000000000000
+    entrypoint: [node, server.js]
+    scaling:
+        min-scale: 1
+    environment:
+        - name: VONAGE_APPLICATION_ID
+          value: "00000000-0000-0000-0000-000000000000"
+        - name: VONAGE_FROM
+          value: "447700900000"
+        - name: PUBLIC_BASE
+          value: "https://your-instance.euw1.runtime.vonage.cloud"
+        # Salesforce (optional) - or connect at runtime in the UI
+        # - name: SF_LOGIN_URL
+        #   value: "https://your-domain.my.salesforce.com"
+        # - name: SF_CLIENT_ID
+        #   secret: SF_CLIENT_ID
+        # - name: SF_CLIENT_SECRET
+        #   secret: SF_CLIENT_SECRET
