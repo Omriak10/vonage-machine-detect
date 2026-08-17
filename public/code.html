@@ -1,93 +1,208 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Vonage Machine Detect - Source</title>
+<title>Vonage Machine Detect - Code & API</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{min-height:100vh;background:#fff;font-family:'Segoe UI',system-ui,Arial,sans-serif;color:#131415;padding:0 0 80px}
+body{min-height:100vh;background:#fff;font-family:'Segoe UI',system-ui,Arial,sans-serif;color:#131415;padding:0 0 90px}
 .topbar{display:flex;align-items:center;gap:12px;padding:20px 28px;border-bottom:1px solid #e8e8e8}
 .topbar svg{width:30px;height:27px;flex:none}
 .topbar b{font-size:17px;font-weight:700}
 .topbar span{color:#86888a;font-size:13.5px;border-left:1px solid #e0e0e0;padding-left:12px;margin-left:2px}
 .topbar a{margin-left:auto;color:#131415;font-size:13px;font-weight:700;text-decoration:none;border:1px solid #131415;border-radius:2px;padding:8px 14px}
-.wrap{max-width:920px;margin:0 auto;padding:0 20px}
-h1{font-size:28px;font-weight:700;letter-spacing:-.5px;margin:34px 0 8px}
-.sub{color:#5a5c5e;font-size:14.5px;line-height:1.6;margin-bottom:22px;max-width:680px}
+.wrap{max-width:940px;margin:0 auto;padding:0 20px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid #e0e0e0;margin:22px 0 26px}
+.tab{background:none;border:0;font:inherit;font-weight:700;font-size:14.5px;color:#86888a;padding:13px 20px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tab.on{color:#131415;border-bottom-color:#131415}
+.view{display:none}.view.on{display:block}
+h1{font-size:27px;font-weight:700;letter-spacing:-.5px;margin:4px 0 8px}
+h2{font-size:16px;font-weight:700;margin:30px 0 10px;padding-top:14px;border-top:1px solid #eee}
+h2:first-of-type{border-top:0;padding-top:0}
+.sub{color:#5a5c5e;font-size:14.5px;line-height:1.6;margin-bottom:14px;max-width:720px}
 .sub b{color:#131415}
+p{font-size:14px;color:#3c3e40;line-height:1.6;margin:10px 0;max-width:720px}
+code{background:#f4f4f4;border-radius:2px;padding:1px 6px;font-family:Consolas,monospace;font-size:13px}
+table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}
+th{background:#131415;color:#fff;text-align:left;padding:8px 10px;font-weight:600}
+td{padding:8px 10px;border-bottom:1px solid #eee;vertical-align:top}
+td code{background:#f4f4f4}
+tr:nth-child(even) td{background:#fafafa}
+.code{position:relative;background:#131415;border-radius:3px;margin:12px 0;overflow:hidden}
+.code pre{margin:0;padding:15px 16px;overflow-x:auto;font-family:Consolas,monospace;font-size:12.5px;line-height:1.6;color:#e9eb0d;color:#eaecef}
+.code .cp{position:absolute;top:8px;right:8px;background:#2a2c2f;border:1px solid #3a3d41;color:#eaecef;font-size:11px;font-weight:700;padding:5px 11px;border-radius:2px;cursor:pointer}
+.code .cp:hover{background:#3a3d41}
+.pill{display:inline-block;font-family:Consolas,monospace;font-size:11px;font-weight:700;padding:2px 7px;border-radius:2px;margin-right:6px}
+.get{background:#e7f0ff;color:#1b4fa0}.post{background:#e9f7ec;color:#1c7a34}.del{background:#fdeaea;color:#b3261e}
+.note{border-left:3px solid #131415;background:#fafafa;padding:11px 14px;font-size:13.5px;color:#3c3e40;margin:14px 0;line-height:1.55}
+/* source tab */
 .opts{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
 .opt{border:1px solid #131415;border-radius:2px;padding:16px 18px;flex:1;min-width:240px}
 .opt h3{font-size:12px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:#86888a;margin-bottom:8px}
-.opt code{display:block;background:#f5f5f5;border-radius:2px;padding:10px 12px;font-family:Consolas,monospace;font-size:13px;margin-top:8px;overflow-x:auto;white-space:nowrap}
-.opt p{font-size:13.5px;color:#5a5c5e;line-height:1.5}
-.bar{display:flex;gap:10px;align-items:center;margin:26px 0 10px}
-.bar h2{font-size:13px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:#131415}
-button{background:#131415;border:1px solid #131415;border-radius:2px;color:#fff;font-size:13px;font-weight:700;padding:9px 15px;cursor:pointer;font-family:inherit}
-button:hover{background:#000}
+.opt code{display:block;background:#f5f5f5;padding:10px 12px;margin-top:8px;overflow-x:auto;white-space:nowrap}
+.opt p{font-size:13.5px}
+.bar{display:flex;gap:10px;align-items:center;margin:24px 0 10px}
+.bar h2{border:0;padding:0;margin:0;font-size:13px;letter-spacing:.6px;text-transform:uppercase}
+button.btn{background:#131415;border:1px solid #131415;border-radius:2px;color:#fff;font-size:13px;font-weight:700;padding:9px 15px;cursor:pointer;font-family:inherit}
+button.btn:hover{background:#000}
 .ghost{background:#fff;color:#131415}.ghost:hover{background:#f4f4f4}
 .file{border:1px solid #e0e0e0;border-radius:2px;margin-bottom:12px;overflow:hidden}
 .fhead{display:flex;align-items:center;gap:12px;padding:11px 14px;background:#fafafa;border-bottom:1px solid #e8e8e8;cursor:pointer}
 .fhead .nm{font-family:Consolas,monospace;font-size:13.5px;font-weight:700;flex:1}
 .fhead .sz{font-size:12px;color:#9aa0a8}
 .fhead .cp{font-size:12px;padding:6px 12px}
-pre{margin:0;padding:16px;overflow-x:auto;font-family:Consolas,monospace;font-size:12.5px;line-height:1.55;max-height:460px;background:#fff;display:none}
-pre.open{display:block}
-.foot{max-width:920px;margin:40px auto 0;padding:0 20px;color:#a9abad;font-size:12px}
+.fpre{margin:0;padding:16px;overflow-x:auto;font-family:Consolas,monospace;font-size:12.5px;line-height:1.55;max-height:460px;background:#fff;display:none}
+.fpre.open{display:block}
+.foot{max-width:940px;margin:44px auto 0;padding:0 20px;color:#a9abad;font-size:12px}
+.hide{display:none}
 </style></head><body>
 <div class="topbar">
   <svg viewBox="0 0 34 30" fill="#131415"><path d="M13.031 14.745L6.656.6H0l9.547 21.486c.042.093.174.093.214 0l3.27-7.34zM26.933.6s-8.635 19.478-9.715 21.862c-2.582 5.697-4.495 7.123-6.444 7.428a.037.037 0 00-.032.037c0 .02.016.038.037.038h6.097c2.683 0 4.519-1.805 7.105-7.503C24.885 20.472 33.706.6 33.706.6h-6.773z"/></svg>
-  <b>VONAGE</b><span>Machine Detect - Source</span>
+  <b>VONAGE</b><span>Machine Detect - Code &amp; API</span>
   <a href="/">&larr; Back to console</a>
 </div>
 <div class="wrap">
-  <h1>Take the whole thing with you</h1>
-  <div class="sub">Every file this app is built from - so your team can run it <b>anywhere</b>, VCR or your own servers. It's a plain Node/Express app; there's no lock-in. <b>No credentials are ever in the source</b> - all config is environment variables (see <code>.env.example</code>).</div>
-
-  <div class="opts">
-    <div class="opt">
-      <h3>Clone from GitHub</h3>
-      <p>The cleanest way - full history and updates.</p>
-      <code>git clone https://github.com/Omriak10/vonage-machine-detect.git</code>
-    </div>
-    <div class="opt">
-      <h3>Or copy from here</h3>
-      <p>Every source file is below. Copy one, copy them all, or download each. Then <code>npm install</code> and set your env.</p>
-    </div>
+  <div class="tabs">
+    <button class="tab on" id="tApi" onclick="show('api')">API reference</button>
+    <button class="tab" id="tSrc" onclick="show('src')">Source files</button>
   </div>
 
-  <div class="bar">
-    <h2>Source files</h2>
-    <button class="ghost" onclick="copyAll()">Copy all files</button>
-    <span id="allSt" style="font-size:12px;color:#9aa0a8"></span>
+  <!-- ================= API ================= -->
+  <div class="view on" id="vApi">
+    <h1>Drive it all from the API</h1>
+    <div class="sub">The console is just a client. Every capability here is a plain HTTP endpoint, so you can run campaigns straight from your dialer, CRM or backend - no UI needed. Base URL is this service; examples use <code>$BASE</code>.</div>
+    <div class="code"><button class="cp" onclick="cp(this)">Copy</button><pre>BASE="__BASE__"</pre></div>
+
+    <h2>Endpoints</h2>
+    <table>
+      <tr><th>Method &amp; path</th><th>Purpose</th></tr>
+      <tr><td><span class="pill post">POST</span><code>/api/call</code></td><td>Place a call or start a run (transfer modes or a drop campaign)</td></tr>
+      <tr><td><span class="pill get">GET</span><code>/api/run/:id</code></td><td>Run status + per-leg outcomes (poll from your system)</td></tr>
+      <tr><td><span class="pill post">POST</span><code>/api/list</code></td><td>Save a reusable named call list; returns its <code>id</code></td></tr>
+      <tr><td><span class="pill get">GET</span><code>/api/lists</code></td><td>List saved call lists</td></tr>
+      <tr><td><span class="pill get">GET</span><code>/api/list/registry/:id</code></td><td>A saved list's members</td></tr>
+      <tr><td><span class="pill del">DEL</span><code>/api/list/:id</code></td><td>Delete a saved list</td></tr>
+      <tr><td><span class="pill post">POST</span><code>/api/message?name=</code></td><td>Store a named voicemail (raw WAV body); returns its <code>id</code></td></tr>
+      <tr><td><span class="pill get">GET</span><code>/api/messages</code></td><td>List named messages</td></tr>
+      <tr><td><span class="pill del">DEL</span><code>/api/message/:id</code></td><td>Delete a named message</td></tr>
+      <tr><td><span class="pill get">GET</span><code>/api/sf/lists</code> &middot; <code>/api/sf/list/:id</code></td><td>Salesforce campaigns and their members</td></tr>
+      <tr><td><span class="pill get">GET</span><code>/api/log?since=</code></td><td>Event timeline (for a dashboard)</td></tr>
+    </table>
+
+    <h2>Transfer on machine</h2>
+    <p>Call one number; when a <b>machine</b> answers, transfer to a colleague. A <b>human</b> answer is left a short notice.</p>
+    <div class="code"><button class="cp" onclick="cp(this)">Copy</button><pre>curl -X POST $BASE/api/call -H 'Content-Type: application/json' -d '{
+  "mode": "detect",
+  "to": "447700900461",
+  "forward": "447700900123"
+}'</pre></div>
+    <p><code>mode</code>: <code>detect</code> (transfer as soon as a machine is detected) or <code>detect_beep</code> (after the voicemail beep).</p>
+
+    <h2>Voicemail-drop campaign with human &rarr; agent</h2>
+    <p>Dial a whole list. Machines get your recorded/auto message; <b>humans transfer to a live agent</b> over SIP (e.g. Vonage Contact Center) with custom headers for routing and the CRM screen pop.</p>
+    <div class="code"><button class="cp" onclick="cp(this)">Copy</button><pre>curl -X POST $BASE/api/call -H 'Content-Type: application/json' -d '{
+  "mode": "drop",
+  "members": [ { "number": "447700900461", "whoId": "a0X...", "name": "Jane Doe" } ],
+  "messageId": "943ae6bc",
+  "concurrency": 5,
+  "from": "447700900000,447700900001",
+  "humanAction": "sip",
+  "sipUri": "sip:queue@yourvcc.sip.vonage.com",
+  "sipHeaders": { "X-NVM-AgentId": "1234", "X-NVM-RecordId": "{{whoId}}" },
+  "resultWebhook": "https://your-system.example.com/vonage-results"
+}'</pre></div>
+
+    <h2>Drop-run options</h2>
+    <table>
+      <tr><th>Field</th><th>Meaning</th></tr>
+      <tr><td><code>numbers</code> / <code>members</code> / <code>listId</code></td><td>The list: pasted/CSV text, an array of <code>{number,whoId?,name?}</code>, or a saved list id.</td></tr>
+      <tr><td><code>messageId</code></td><td>Which named message to play into machines. Omit for the default/automatic message.</td></tr>
+      <tr><td><code>concurrency</code></td><td>Simultaneous calls, 1-10 (default 1). Staggered to respect account calls-per-second. Pace to your available agents.</td></tr>
+      <tr><td><code>from</code></td><td>One caller number, or several (comma-separated / array) to spread the run across a <b>number pool</b> (round-robin). Defaults to the configured number.</td></tr>
+      <tr><td><code>humanAction</code></td><td><code>skip</code> (default), <code>forward</code> (to <code>humanForward</code>, a phone number), or <code>sip</code> (to <code>sipUri</code> + <code>sipHeaders</code>).</td></tr>
+      <tr><td><code>sipHeaders</code></td><td>Custom INVITE headers. Values template per contact: <code>{{whoId}}</code> <code>{{number}}</code> <code>{{name}}</code> <code>{{runId}}</code> <code>{{legId}}</code>.</td></tr>
+      <tr><td><code>resultWebhook</code></td><td>HTTPS URL - every outcome is POSTed to you (see below).</td></tr>
+      <tr><td><code>logToSf</code></td><td><code>true</code> to also log each outcome to Salesforce (if connected).</td></tr>
+    </table>
+
+    <h2>Outcome webhook</h2>
+    <p>Set <code>resultWebhook</code> and we POST every call result to your endpoint, then a final <code>run_completed</code>. Keeps your CRM writes on your side.</p>
+    <div class="code"><button class="cp" onclick="cp(this)">Copy</button><pre>// per call
+{ "event": "call_result", "runId": "ab12cd34", "legId": 0,
+  "number": "447700900461", "name": "Jane Doe", "whoId": "a0X...",
+  "outcome": "machine_message_dropped", "callUuid": "…", "at": "2026-…Z" }
+
+// when the run ends
+{ "event": "run_completed", "runId": "ab12cd34", "total": 500,
+  "counts": { "machine_message_dropped": 210, "human_transferred": 60, … } }</pre></div>
+    <p>Outcomes: <code>machine_message_dropped</code>, <code>machine_transferred</code>, <code>human_transferred</code>, <code>human_skipped</code>, <code>no_answer</code>, <code>busy</code>, <code>failed</code>, <code>transfer_failed</code>.</p>
+
+    <h2>Saved lists &amp; messages</h2>
+    <p>Save a reusable list (paste or CSV: <code>number,name,salesforceId</code> per line), then run it by <code>listId</code>.</p>
+    <div class="code"><button class="cp" onclick="cp(this)">Copy</button><pre>curl -X POST $BASE/api/list -H 'Content-Type: application/json' -d '{
+  "name": "Campaign North",
+  "numbers": "447700900461,Jane Doe\n447700900462,John Roe"
+}'
+# -> { "id": "df8c69cb", ... }   then:  "listId": "df8c69cb" in /api/call</pre></div>
+    <p>Store a per-campaign voicemail (WAV, 16-bit PCM; the console records/encodes it for you):</p>
+    <div class="code"><button class="cp" onclick="cp(this)">Copy</button><pre>curl -X POST "$BASE/api/message?name=Campaign%20North" \
+  -H 'Content-Type: audio/wav' --data-binary @message.wav</pre></div>
+
+    <div class="note"><b>Auth &amp; security.</b> The service authenticates to Vonage with your application's private key (server-side). The console/API sit behind your VCR instance - add your own access control before exposing them. Set <code>VONAGE_SIGNATURE_SECRET</code> to verify Vonage's event webhooks. Full setup, billing and self-host steps are in <b>IMPLEMENTATION.md</b> (Source tab / GitHub).</div>
   </div>
-  <div id="files"></div>
+
+  <!-- ================= SOURCE ================= -->
+  <div class="view" id="vSrc">
+    <h1>Take the whole thing with you</h1>
+    <div class="sub">Every file this app is built from - run it <b>anywhere</b>, VCR or your own servers. Plain Node/Express, no lock-in. <b>No credentials are ever in the source</b> - all config is environment variables (<code>.env.example</code>).</div>
+    <div class="opts">
+      <div class="opt"><h3>Clone from GitHub</h3><p>Cleanest - full history and updates.</p><code>git clone https://github.com/Omriak10/vonage-machine-detect.git</code></div>
+      <div class="opt"><h3>Or copy from here</h3><p>Every file is below. Copy one, copy all, or download. Then <code>npm install</code> and set your env.</p></div>
+    </div>
+    <div class="bar"><h2>Source files</h2><button class="btn ghost" onclick="copyAll()">Copy all files</button><span id="allSt" style="font-size:12px;color:#9aa0a8"></span></div>
+    <div id="files"></div>
+  </div>
 </div>
 <div class="foot">Powered by Vonage Voice API &middot; advanced_machine_detection</div>
 
 <script>
-let SRC = [];
+var BASE = location.origin;
+function show(w){
+  document.getElementById('vApi').classList.toggle('on', w==='api');
+  document.getElementById('vSrc').classList.toggle('on', w==='src');
+  document.getElementById('tApi').classList.toggle('on', w==='api');
+  document.getElementById('tSrc').classList.toggle('on', w==='src');
+  if(w==='src' && !window._loaded){ loadSource(); window._loaded=true; }
+  window.scrollTo({top:0});
+}
+function cp(btn){
+  var pre = btn.parentElement.querySelector('pre');
+  navigator.clipboard.writeText(pre.textContent);
+  var o=btn.textContent; btn.textContent='Copied'; setTimeout(function(){btn.textContent=o;},1200);
+}
+// fill $BASE into the base example
+document.addEventListener('DOMContentLoaded', function(){
+  document.querySelectorAll('pre').forEach(function(p){ p.textContent = p.textContent.replace('__BASE__', BASE); });
+});
+
+var SRC = [];
 function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
-async function load(){
-  const d = await (await fetch('/api/source')).json();
-  SRC = d.files;
-  const box = document.getElementById('files');
-  box.innerHTML = SRC.map((f,i) => `
-    <div class="file">
-      <div class="fhead" onclick="toggle(${i})">
-        <span class="nm">${f.path}</span>
-        <span class="sz">${(f.content.length/1024).toFixed(1)} KB</span>
-        <button class="cp" onclick="event.stopPropagation();copyOne(${i},this)">Copy</button>
-        <a class="cp" style="text-decoration:none" href="/code/raw/${encodeURIComponent(f.path.split('/').join('__'))}" download onclick="event.stopPropagation()"><button class="ghost cp">Download</button></a>
-      </div>
-      <pre id="pre${i}">${esc(f.content)}</pre>
-    </div>`).join('');
+async function loadSource(){
+  try{
+    var d = await (await fetch('/api/source')).json();
+    SRC = d.files;
+    var rows = SRC.map(function(f,i){
+      var raw = '/code/raw/' + encodeURIComponent(f.path.split('/').join('__'));
+      return '<div class="file"><div class="fhead" onclick="toggle('+i+')">'
+        + '<span class="nm">'+f.path+'</span><span class="sz">'+(f.content.length/1024).toFixed(1)+' KB</span>'
+        + '<button class="btn cp" onclick="event.stopPropagation();copyOne('+i+',this)">Copy</button>'
+        + '<a href="'+raw+'" download onclick="event.stopPropagation()"><button class="btn ghost cp">Download</button></a>'
+        + '</div><pre class="fpre" id="pre'+i+'">'+esc(f.content)+'</pre></div>';
+    }).join('');
+    document.getElementById('files').innerHTML = rows;
+  }catch(e){ document.getElementById('files').innerHTML = '<p>Could not load source: '+e.message+'</p>'; }
 }
 function toggle(i){ document.getElementById('pre'+i).classList.toggle('open'); }
-async function copyOne(i,btn){ await navigator.clipboard.writeText(SRC[i].content); const o=btn.textContent; btn.textContent='Copied'; setTimeout(()=>btn.textContent=o,1200); }
-async function copyAll(){
-  const blob = SRC.map(f => '===== '+f.path+' =====\n'+f.content).join('\n\n\n');
-  await navigator.clipboard.writeText(blob);
-  document.getElementById('allSt').textContent = 'Copied all '+SRC.length+' files to the clipboard.';
-}
-load();
+async function copyOne(i,btn){ await navigator.clipboard.writeText(SRC[i].content); var o=btn.textContent; btn.textContent='Copied'; setTimeout(function(){btn.textContent=o;},1200); }
+async function copyAll(){ var blob = SRC.map(function(f){return '===== '+f.path+' =====\n'+f.content;}).join('\n\n\n'); await navigator.clipboard.writeText(blob); document.getElementById('allSt').textContent='Copied all '+SRC.length+' files.'; }
 </script>
 </body></html>
