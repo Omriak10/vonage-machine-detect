@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vonage Machine Detect - Source</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{min-height:100vh;background:#fff;font-family:'Segoe UI',system-ui,Arial,sans-serif;color:#131415;padding:0 0 80px}
+.topbar{display:flex;align-items:center;gap:12px;padding:20px 28px;border-bottom:1px solid #e8e8e8}
+.topbar svg{width:30px;height:27px;flex:none}
+.topbar b{font-size:17px;font-weight:700}
+.topbar span{color:#86888a;font-size:13.5px;border-left:1px solid #e0e0e0;padding-left:12px;margin-left:2px}
+.topbar a{margin-left:auto;color:#131415;font-size:13px;font-weight:700;text-decoration:none;border:1px solid #131415;border-radius:2px;padding:8px 14px}
+.wrap{max-width:920px;margin:0 auto;padding:0 20px}
+h1{font-size:28px;font-weight:700;letter-spacing:-.5px;margin:34px 0 8px}
+.sub{color:#5a5c5e;font-size:14.5px;line-height:1.6;margin-bottom:22px;max-width:680px}
+.sub b{color:#131415}
+.opts{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.opt{border:1px solid #131415;border-radius:2px;padding:16px 18px;flex:1;min-width:240px}
+.opt h3{font-size:12px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:#86888a;margin-bottom:8px}
+.opt code{display:block;background:#f5f5f5;border-radius:2px;padding:10px 12px;font-family:Consolas,monospace;font-size:13px;margin-top:8px;overflow-x:auto;white-space:nowrap}
+.opt p{font-size:13.5px;color:#5a5c5e;line-height:1.5}
+.bar{display:flex;gap:10px;align-items:center;margin:26px 0 10px}
+.bar h2{font-size:13px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:#131415}
+button{background:#131415;border:1px solid #131415;border-radius:2px;color:#fff;font-size:13px;font-weight:700;padding:9px 15px;cursor:pointer;font-family:inherit}
+button:hover{background:#000}
+.ghost{background:#fff;color:#131415}.ghost:hover{background:#f4f4f4}
+.file{border:1px solid #e0e0e0;border-radius:2px;margin-bottom:12px;overflow:hidden}
+.fhead{display:flex;align-items:center;gap:12px;padding:11px 14px;background:#fafafa;border-bottom:1px solid #e8e8e8;cursor:pointer}
+.fhead .nm{font-family:Consolas,monospace;font-size:13.5px;font-weight:700;flex:1}
+.fhead .sz{font-size:12px;color:#9aa0a8}
+.fhead .cp{font-size:12px;padding:6px 12px}
+pre{margin:0;padding:16px;overflow-x:auto;font-family:Consolas,monospace;font-size:12.5px;line-height:1.55;max-height:460px;background:#fff;display:none}
+pre.open{display:block}
+.foot{max-width:920px;margin:40px auto 0;padding:0 20px;color:#a9abad;font-size:12px}
+</style></head><body>
+<div class="topbar">
+  <svg viewBox="0 0 34 30" fill="#131415"><path d="M13.031 14.745L6.656.6H0l9.547 21.486c.042.093.174.093.214 0l3.27-7.34zM26.933.6s-8.635 19.478-9.715 21.862c-2.582 5.697-4.495 7.123-6.444 7.428a.037.037 0 00-.032.037c0 .02.016.038.037.038h6.097c2.683 0 4.519-1.805 7.105-7.503C24.885 20.472 33.706.6 33.706.6h-6.773z"/></svg>
+  <b>VONAGE</b><span>Machine Detect - Source</span>
+  <a href="/">&larr; Back to console</a>
+</div>
+<div class="wrap">
+  <h1>Take the whole thing with you</h1>
+  <div class="sub">Every file this app is built from - so your team can run it <b>anywhere</b>, VCR or your own servers. It's a plain Node/Express app; there's no lock-in. <b>No credentials are ever in the source</b> - all config is environment variables (see <code>.env.example</code>).</div>
+
+  <div class="opts">
+    <div class="opt">
+      <h3>Clone from GitHub</h3>
+      <p>The cleanest way - full history and updates.</p>
+      <code>git clone https://github.com/Omriak10/vonage-machine-detect.git</code>
+    </div>
+    <div class="opt">
+      <h3>Or copy from here</h3>
+      <p>Every source file is below. Copy one, copy them all, or download each. Then <code>npm install</code> and set your env.</p>
+    </div>
+  </div>
+
+  <div class="bar">
+    <h2>Source files</h2>
+    <button class="ghost" onclick="copyAll()">Copy all files</button>
+    <span id="allSt" style="font-size:12px;color:#9aa0a8"></span>
+  </div>
+  <div id="files"></div>
+</div>
+<div class="foot">Powered by Vonage Voice API &middot; advanced_machine_detection</div>
+
+<script>
+let SRC = [];
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+async function load(){
+  const d = await (await fetch('/api/source')).json();
+  SRC = d.files;
+  const box = document.getElementById('files');
+  box.innerHTML = SRC.map((f,i) => `
+    <div class="file">
+      <div class="fhead" onclick="toggle(${i})">
+        <span class="nm">${f.path}</span>
+        <span class="sz">${(f.content.length/1024).toFixed(1)} KB</span>
+        <button class="cp" onclick="event.stopPropagation();copyOne(${i},this)">Copy</button>
+        <a class="cp" style="text-decoration:none" href="/code/raw/${encodeURIComponent(f.path.split('/').join('__'))}" download onclick="event.stopPropagation()"><button class="ghost cp">Download</button></a>
+      </div>
+      <pre id="pre${i}">${esc(f.content)}</pre>
+    </div>`).join('');
+}
+function toggle(i){ document.getElementById('pre'+i).classList.toggle('open'); }
+async function copyOne(i,btn){ await navigator.clipboard.writeText(SRC[i].content); const o=btn.textContent; btn.textContent='Copied'; setTimeout(()=>btn.textContent=o,1200); }
+async function copyAll(){
+  const blob = SRC.map(f => '===== '+f.path+' =====\n'+f.content).join('\n\n\n');
+  await navigator.clipboard.writeText(blob);
+  document.getElementById('allSt').textContent = 'Copied all '+SRC.length+' files to the clipboard.';
+}
+load();
+</script>
+</body></html>
