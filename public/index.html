@@ -110,15 +110,39 @@ button:disabled{opacity:.4;cursor:default}
     <textarea id="numbers" placeholder="447700900461&#10;447700900462&#10;447700900463"></textarea>
     <div class="hint" id="listSrc">Or load a list from Salesforce above.</div>
     <label>Voicemail message</label>
+    <select id="msgSel"><option value="">Automatic / default message</option></select>
     <div class="rec">
       <div class="row">
         <button id="recBtn" class="ghost small" onclick="toggleRec()">&#9679; Record</button>
         <button class="ghost small" onclick="document.getElementById('upl').click()">&#8593; Upload audio</button>
         <span class="st" id="recSt">Using the <b>automatic message</b>.</span>
       </div>
+      <div class="row" style="margin-top:10px">
+        <input id="msgName" placeholder="Save as (campaign name, optional)" style="margin:0;font-size:13px;padding:9px 12px">
+      </div>
       <input id="upl" type="file" accept="audio/*" class="hide" onchange="uploadFile(this.files[0])">
       <audio id="player" controls class="hide"></audio>
       <button id="clearBtn" class="ghost small hide" onclick="clearMsg()" style="margin-top:10px">Use automatic message instead</button>
+    </div>
+    <label>Calls at once</label>
+    <input id="conc" type="number" min="1" max="10" value="1">
+    <div class="hint">Simultaneous calls for this run (1-10). Pace it to your available agents.</div>
+    <label>When a human answers</label>
+    <select id="humanAct" onchange="humanChanged()">
+      <option value="skip">Skip - no message, end politely</option>
+      <option value="forward">Transfer to a phone number</option>
+      <option value="sip">Transfer to a SIP agent (e.g. Vonage Contact Center)</option>
+    </select>
+    <div id="humanFwdWrap" class="hide">
+      <label>Transfer humans to</label>
+      <input id="humanFwd" type="tel" placeholder="447700900123" autocomplete="off">
+    </div>
+    <div id="humanSipWrap" class="hide">
+      <label>SIP endpoint</label>
+      <input id="sipUri" placeholder="sip:queue@yourvcc.sip.vonage.com" autocomplete="off">
+      <label>Custom SIP headers (JSON)</label>
+      <textarea id="sipHeaders" style="min-height:70px" placeholder='{"X-NVM-AgentId":"1234","X-NVM-RecordId":"{{whoId}}"}'></textarea>
+      <div class="hint">Values support {{whoId}}, {{number}}, {{name}} per called contact - e.g. for the agent's screen pop.</div>
     </div>
   </div>
 
@@ -148,6 +172,24 @@ button:disabled{opacity:.4;cursor:default}
 let since = 0, polling = null, sfMembers = null;
 const el = (id) => document.getElementById(id);
 
+function humanChanged() {
+  const v = el('humanAct').value;
+  el('humanFwdWrap').classList.toggle('hide', v !== 'forward');
+  el('humanSipWrap').classList.toggle('hide', v !== 'sip');
+}
+async function loadMessages(selectId) {
+  try {
+    const d = await (await fetch('/api/messages')).json();
+    const sel = el('msgSel');
+    sel.innerHTML = '<option value="">Automatic / default message</option>';
+    (d.messages || []).forEach((m) => {
+      const o = document.createElement('option');
+      o.value = m.id; o.textContent = m.name;
+      sel.appendChild(o);
+    });
+    if (selectId) sel.value = selectId;
+  } catch (e) {}
+}
 function modeChanged() {
   const drop = el('mode').value === 'drop';
   el('single').classList.toggle('hide', drop);
@@ -214,6 +256,15 @@ async function place() {
   if (mode === 'drop') {
     if (sfMembers && sfMembers.length) body.members = sfMembers;
     else body.numbers = el('numbers').value.replace(/\/\/.*$/gm, '');
+    if (el('msgSel').value) body.messageId = el('msgSel').value;
+    body.concurrency = parseInt(el('conc').value, 10) || 1;
+    body.humanAction = el('humanAct').value;
+    if (body.humanAction === 'forward') body.humanForward = el('humanFwd').value;
+    if (body.humanAction === 'sip') {
+      body.sipUri = el('sipUri').value;
+      try { body.sipHeaders = el('sipHeaders').value.trim() ? JSON.parse(el('sipHeaders').value) : {}; }
+      catch (e) { alert('SIP headers must be valid JSON'); b.disabled = false; return; }
+    }
   } else { body.to = el('to').value; body.forward = el('forward').value; }
   try {
     const r = await fetch('/api/call', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -254,9 +305,13 @@ async function encodeUpload(float, inRate, secsLabel) {
   w(36, 'data'); v.setUint32(40, pcm.length * 2, true); new Int16Array(buf, 44).set(pcm);
 
   el('recSt').textContent = 'uploading...';
-  const r = await fetch('/api/message', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: buf });
+  const saveName = el('msgName').value.trim();
+  const url = saveName ? '/api/message?name=' + encodeURIComponent(saveName) : '/api/message';
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: buf });
   const d = await r.json();
   if (!r.ok) { el('recSt').textContent = 'upload failed: ' + (d.error || r.status); return; }
+  if (saveName) { el('msgName').value = ''; await loadMessages(d.id);
+    el('recSt').innerHTML = '<b>&ldquo;' + saveName.replace(/</g,'&lt;') + '&rdquo; saved</b> and selected for this run.'; }
   el('recSt').innerHTML = '<b>Voicemail saved</b> - ' + (secsLabel || Math.round(outLen / outRate) + 's') + '. This plays instead of the automatic message.';
   el('player').src = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
   el('player').classList.remove('hide'); el('clearBtn').classList.remove('hide');
@@ -333,6 +388,6 @@ const barEls = document.querySelectorAll('#bars i');
 function setBars(peak) { barEls.forEach((b, i) => { const h = 3 + Math.max(0, peak * 20 - i * 1.5) * (1 + (i % 3)); b.style.height = Math.min(20, h) + 'px'; }); }
 
 async function loadConfig() { try { const d = await (await fetch('/api/config')).json(); if (d.from) el('from').value = d.from; } catch (e) {} }
-refreshMsg(); sfStatus(); loadConfig();
+refreshMsg(); sfStatus(); loadConfig(); loadMessages();
 </script>
 </body></html>

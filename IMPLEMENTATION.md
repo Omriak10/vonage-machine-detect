@@ -37,13 +37,16 @@ You place outbound calls. **Advanced Machine Detection (AMD)** decides whether a
 |------|------------------|----------------|
 | **Transfer (immediate)** | Transfers the call to your forward number as soon as a machine is detected | Leaves a short notice, ends — no transfer |
 | **Transfer (after beep)** | Waits for the voicemail beep, then transfers | Same as above |
-| **Voicemail drop** | Waits for the beep, plays your recorded/auto message, hangs up, and **dials the next number in the list** | Skips — no message left |
+| **Voicemail drop** | Waits for the beep, plays the selected **named message** (or the default/auto), hangs up, and **dials the next number in the list** | Configurable: skip (default), transfer to a phone number, or transfer to a **SIP agent** (e.g. Vonage Contact Center) with custom `X-` headers |
 
 On top of that:
 
 - **Salesforce lists** — pull a call list straight from a Salesforce Campaign; the numbers load automatically.
 - **Salesforce logging** — every outcome writes an Activity back to the contact/lead: *"answering machine — message left"* or *"live conversation"*.
 - **Live listen** — hear the far side of the call (greeting, machine, beep) from the browser, in real time.
+- **Campaign pacing** — drop runs dial with configurable concurrency (1-10 simultaneous calls).
+- **Named messages** — store one voicemail per campaign / call category and pick per run.
+- **Outcome webhooks** — push every call result to your own endpoint and keep CRM writes on your side.
 
 ---
 
@@ -249,9 +252,13 @@ The console is optional — every capability is an HTTP endpoint you can drive f
 
 | Method & path | Body | Does |
 |---|---|---|
-| `POST /api/call` | see below | Places a call / starts a list |
-| `POST /api/message` | raw WAV bytes (`audio/wav`) | Sets the voicemail message |
-| `DELETE /api/message` | — | Reverts to the automatic message |
+| `POST /api/call` | see below | Places a call / starts a run |
+| `GET /api/run/:id` | — | Run status + per-leg outcomes (poll from your system) |
+| `POST /api/message?name=` | raw WAV bytes (`audio/wav`) | Stores a **named** message (per campaign); returns its `id` |
+| `POST /api/message` | raw WAV bytes | Sets the unnamed default message |
+| `GET /api/messages` | — | Lists named messages + default state |
+| `DELETE /api/message/:id` | — | Deletes a named message |
+| `DELETE /api/message` | — | Reverts the default to the automatic message |
 | `GET /api/sf/status` | — | Salesforce connection state |
 | `POST /api/sf/connect` | `{loginUrl, clientId, clientSecret}` | Connect Salesforce at runtime |
 | `GET /api/sf/lists` | — | Campaigns (call lists) |
@@ -281,6 +288,32 @@ curl -X POST https://YOUR-INSTANCE/api/call -H 'Content-Type: application/json' 
 }'
 ```
 `mode` is `detect` | `detect_beep` | `drop`. For a plain list without Salesforce, send `"numbers": "447700900461\n447700900462"` instead of `members`.
+
+**Campaign run with pacing, a named message, human-to-agent transfer and outcome push:**
+```bash
+curl -X POST https://YOUR-INSTANCE/api/call -H 'Content-Type: application/json' -d '{
+  "mode": "drop",
+  "members": [ { "number": "447700900461", "whoId": "a0X...", "name": "Jane Doe" } ],
+  "messageId": "943ae6bc",
+  "concurrency": 5,
+  "humanAction": "sip",
+  "sipUri": "sip:queue@yourvcc.sip.vonage.com",
+  "sipHeaders": { "X-NVM-AgentId": "1234", "X-NVM-RecordId": "{{whoId}}" },
+  "resultWebhook": "https://your-system.example.com/vonage-results"
+}'
+```
+
+**Drop-run options:**
+
+| Field | Meaning |
+|---|---|
+| `messageId` | Which named message to play into machines (store via `POST /api/message?name=`, list via `GET /api/messages`). Omit for the default/automatic message. |
+| `concurrency` | Simultaneous calls for this run, 1-10 (default 1). Launches are staggered ~350 ms apart to respect account calls-per-second limits. Pace it to your available agents - e.g. 5 lines per free agent. |
+| `humanAction` | What happens when a **human** answers: `skip` (default - polite notice, no message), `forward` (transfer to `humanForward`, a phone number), or `sip` (transfer to a SIP endpoint such as **Vonage Contact Center**). Machines always get the voicemail drop. |
+| `sipUri` + `sipHeaders` | The SIP endpoint and custom INVITE headers (e.g. `X-NVM-*` for VCC agent routing and CRM screen pop). Header **values** support per-contact templates: `{{whoId}}`, `{{number}}`, `{{name}}`, `{{runId}}`, `{{legId}}`. |
+| `resultWebhook` | HTTPS URL on your side. Every call outcome is POSTed as `{event:"call_result", runId, legId, number, name, whoId, outcome, callUuid, messageId, at}` - outcomes include `machine_message_dropped`, `human_transferred`, `human_skipped`, `no_answer`, `busy`, `failed`, `transfer_failed` - plus a final `{event:"run_completed", counts}`. Keeps CRM writes (e.g. a Salesforce custom object) entirely on your side. |
+
+**Webhook security (optional):** set `VONAGE_SIGNATURE_SECRET` to your Vonage application's signature secret and the app verifies the signed JWT on every incoming Voice event (spoofed events are dropped).
 
 ### 9.2 Talking to Vonage directly (no this app)
 
