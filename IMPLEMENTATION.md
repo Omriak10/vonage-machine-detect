@@ -25,6 +25,8 @@
 10. [Configuration reference](#10-configuration-reference)
 11. [Security notes](#11-security-notes)
 
+> **Two ways to use it.** The web console is optional. Every capability is a plain HTTP endpoint (see [section 9](#9-using-it-from-your-own-systems-api)), so you can drive the whole thing from your dialer, CRM or backend and never open the UI. And it's a self-contained Node/Express app - clone it, `npm install`, set your env, and run it on VCR **or your own servers**. Grab the source from the **Get the code & API** page in the console, or from GitHub.
+
 > **Vonage can deploy and host this for you.** Everything below is what *you* would do to run it yourself, but your Vonage team can stand the whole solution up on your Vonage Cloud Runtime (VCR) account and hand you the URL. Ask your Vonage contact if you'd prefer that.
 
 ---

@@ -49,6 +49,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { WebSocketServer } = require('ws');
 const sfdc = require('./salesforce');
+const store = require('./store');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -82,9 +83,11 @@ const api = async (method, url, body) => {
 };
 
 // ---------------------------------------------------------------- state
-const runs = {};    // runId -> run (see header). In-memory by design: for
-                    // production, persist runs + messages to a durable store
-                    // and resume from the last unprocessed member on restart.
+const runs = {};    // runId -> run (see header). Persisted to a durable store
+                    // (store.js) so a restart/crash resumes in-flight runs
+                    // instead of losing them.
+let shuttingDown = false;
+const persist = (run) => { if (run) store.save(run); };
 const log = [];
 const addLog = (sid, msg, kind = 'info') => {
   log.push({ t: Date.now(), sid, msg, kind });
@@ -166,6 +169,7 @@ async function placeLeg(runId, legId) {
     return false;
   }
   leg.uuid = data.uuid;
+  persist(run);                       // durable: this number's call uuid is now known
   const who = m.name ? ` (${m.name})` : '';
   addLog(runId, run.mode === 'drop'
     ? `[${legId + 1}/${run.list.length}] calling ${m.number}${who} from ${run.from}`
@@ -181,6 +185,7 @@ function finishLeg(runId, legId, outcome, detail) {
   leg.finished = true; leg.done = true; leg.outcome = outcome;
   run.active = Math.max(0, run.active - 1);
   run.counts[outcome] = (run.counts[outcome] || 0) + 1;
+  persist(run);                       // durable: this leg is now settled
   pushResult(run, legId, outcome, detail);
   launchNext(runId);
 }
@@ -189,11 +194,12 @@ function launchNext(runId) {
   const run = runs[runId];
   if (run.mode !== 'drop') { maybeFinishRun(runId); return; }
   let batch = 0;
-  while (run.active < run.concurrency && run.nextIdx < run.list.length) {
+  while (!shuttingDown && run.active < run.concurrency && run.nextIdx < run.list.length) {
     const legId = run.nextIdx++;
     run.active++; // reserve the slot now; finishLeg releases it
     setTimeout(() => placeLeg(runId, legId), 350 * batch++); // stagger to stay under account CPS
   }
+  persist(run);                       // durable: nextIdx advanced -> resume point
   maybeFinishRun(runId);
 }
 
@@ -208,7 +214,10 @@ function maybeFinishRun(runId) {
     addLog(runId, `run finished - ${c.machine_message_dropped || 0} dropped, ${(c.human_transferred || 0)} transferred, `
       + `${c.human_skipped || 0} humans skipped, ${c.no_answer || 0} no answer, ${c.failed || 0} failed of ${run.list.length}`, 'good');
   }
+  persist(run);
   pushResult(run, null, 'run_completed', null);
+  // keep the finished run on disk for /api/run/:id history; prune old ones lazily
+  setTimeout(() => { if (runs[runId] && runs[runId].finished) { store.remove(runId); } }, 6 * 60 * 60 * 1000);
 }
 
 // fire-and-forget outcome push to the client's webhook
@@ -259,7 +268,9 @@ app.post('/api/call', async (req, res) => {
   const run = {
     id: runId, mode, from, logToSf, resultWebhook,
     legs: {}, nextIdx: 0, active: 0, counts: {}, finished: false,
+    createdAt: Date.now(),
   };
+  if (shuttingDown) return res.status(503).json({ error: 'service is restarting - retry shortly' });
 
   if (mode === 'drop') {
     let list = [];
@@ -287,6 +298,7 @@ app.post('/api/call', async (req, res) => {
       run.sipHeaders = (b.sipHeaders && typeof b.sipHeaders === 'object' && !Array.isArray(b.sipHeaders)) ? b.sipHeaders : {};
     }
     runs[runId] = run;
+    persist(run);
     addLog(runId, `drop run started - ${list.length} number${list.length === 1 ? '' : 's'}, concurrency ${run.concurrency}, ${msgLabel(run)}`
       + (run.humanAction === 'sip' ? `, humans -> SIP agent` : run.humanAction === 'forward' ? `, humans -> ${run.humanForward}` : ', humans skipped')
       + (logToSf ? ', logging to Salesforce' : '') + (resultWebhook ? ', pushing results' : ''));
@@ -304,6 +316,7 @@ app.post('/api/call', async (req, res) => {
   runs[runId] = run;
   run.nextIdx = 1;
   run.active = 1;
+  persist(run);
   const ok = await placeLeg(runId, 0);
   if (!ok) return res.status(502).json({ error: 'Vonage rejected the call - see the log', sid: runId });
   res.json({ ok: true, sid: runId, runId });
@@ -526,6 +539,29 @@ app.get('/api/log', (req, res) => {
 // lets the UI prefill the configured caller number without hard-coding it
 app.get('/api/config', (req, res) => res.json({ from: DEFAULT_FROM }));
 
+// ------------------------------------------------ take the code with you
+// Everything the app is made of, so a team can lift it into their own stack
+// (no VCR required). Secrets are NEVER part of the source - config is env only.
+const SOURCE_FILES = [
+  'server.js', 'salesforce.js', 'store.js', 'public/index.html',
+  'package.json', '.env.example', 'vcr.yml.example', 'README.md', 'IMPLEMENTATION.md',
+];
+const readSource = () => SOURCE_FILES.map((f) => {
+  try { return { path: f, content: fs.readFileSync(path.join(__dirname, f), 'utf8') }; }
+  catch { return null; }
+}).filter(Boolean);
+
+app.get('/api/source', (req, res) => res.json({
+  repo: 'https://github.com/Omriak10/vonage-machine-detect',
+  files: readSource(),
+}));
+app.get('/code/raw/:file', (req, res) => {
+  const f = SOURCE_FILES.find((x) => x.replace(/\//g, '__') === req.params.file || x === req.params.file);
+  if (!f) return res.status(404).end();
+  res.set('Content-Type', 'text/plain; charset=utf-8').send(fs.readFileSync(path.join(__dirname, f), 'utf8'));
+});
+app.get('/code', (req, res) => res.sendFile(path.join(__dirname, 'public', 'code.html')));
+
 // ------------------------------------------------------ live listen bridge
 // Vonage streams the call audio here; every browser listener gets a copy.
 const server = http.createServer(app);
@@ -552,4 +588,58 @@ wss.on('connection', (sock, req) => {
   sock.close();
 });
 
-server.listen(PORT, () => console.log('Machine Detect (VCR) on :' + PORT));
+// ------------------------------------------------ resume after a restart
+// Rehydrate persisted runs so late/retried Vonage events find their run, then
+// reconcile in-flight legs and resume dialling the not-yet-dialled members.
+async function reconcile() {
+  const saved = store.all();
+  const ids = Object.keys(saved);
+  if (!ids.length) return;
+  console.log(`[resume] found ${ids.length} persisted run(s)`);
+  for (const id of ids) {
+    const r = saved[id];
+    if (r.finished) { store.remove(id); continue; }
+    // rehydrate runtime fields
+    r.active = 0; r.cur = null;
+    runs[id] = r;
+    addLog(id, `resuming run after restart - ${Object.keys(r.legs).length} dialled of ${r.list.length}, ${r.nextIdx} claimed`, 'warn');
+
+    // reconcile legs that were dialled but not settled: ask Vonage what happened
+    for (const [legId, leg] of Object.entries(r.legs)) {
+      if (leg.finished) continue;
+      if (!leg.uuid) { finishLeg(id, Number(legId), 'failed', 'no call placed before restart'); continue; }
+      const { status, data } = await api('GET', 'https://api.nexmo.com/v1/calls/' + leg.uuid).catch(() => ({ status: 0, data: {} }));
+      const st = (data && data.status) || '';
+      if (status >= 300) { finishLeg(id, Number(legId), leg.outcome || 'reconcile_unknown', 'call not found on reconcile'); continue; }
+      if (['completed', 'failed', 'rejected', 'busy', 'unanswered', 'timeout', 'cancelled'].includes(st)) {
+        // the call already ended while we were down - settle the leg
+        finishLeg(id, Number(legId), leg.outcome || 'ended_during_restart', `reconciled: ${st}`);
+      } else {
+        // still live (ringing/answered) - its own events will keep arriving at
+        // this instance's event_url now that we're back; leave the slot held.
+        r.active++;
+        addLog(id, `leg ${Number(legId) + 1} still live (${st}) - awaiting its events`);
+      }
+    }
+    // resume dialling whatever was never claimed
+    launchNext(id);
+  }
+}
+
+// ------------------------------------------------ graceful shutdown
+function shutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[${sig}] draining - not starting new calls; in-flight calls persist and resume on next boot`);
+  // flush everything to disk (already persisted at each transition, but be safe)
+  for (const r of Object.values(runs)) if (!r.finished) store.save(r);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 8000).unref(); // hard stop backstop
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+server.listen(PORT, () => {
+  console.log('Machine Detect (VCR) on :' + PORT);
+  reconcile().catch((e) => console.error('[resume] error', e.message));
+});
