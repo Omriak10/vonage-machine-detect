@@ -261,6 +261,10 @@ The console is optional — every capability is an HTTP endpoint you can drive f
 | `GET /api/messages` | — | Lists named messages + default state |
 | `DELETE /api/message/:id` | — | Deletes a named message |
 | `DELETE /api/message` | — | Reverts the default to the automatic message |
+| `POST /api/list` | `{name, numbers}` or `{name, members}` | Saves a **reusable named list**; returns its `id` |
+| `GET /api/lists` | — | Lists saved call lists |
+| `GET /api/list/registry/:id` | — | A saved list's members |
+| `DELETE /api/list/:id` | — | Deletes a saved list |
 | `GET /api/sf/status` | — | Salesforce connection state |
 | `POST /api/sf/connect` | `{loginUrl, clientId, clientSecret}` | Connect Salesforce at runtime |
 | `GET /api/sf/lists` | — | Campaigns (call lists) |
@@ -310,10 +314,13 @@ curl -X POST https://YOUR-INSTANCE/api/call -H 'Content-Type: application/json' 
 | Field | Meaning |
 |---|---|
 | `messageId` | Which named message to play into machines (store via `POST /api/message?name=`, list via `GET /api/messages`). Omit for the default/automatic message. |
+| `listId` | Use a **saved list** (from `POST /api/list` / `GET /api/lists`) instead of `numbers`/`members`. Lists can also be pasted or CSV-uploaded in the console (`number,name,salesforceId` per line). |
 | `concurrency` | Simultaneous calls for this run, 1-10 (default 1). Launches are staggered ~350 ms apart to respect account calls-per-second limits. Pace it to your available agents - e.g. 5 lines per free agent. |
 | `humanAction` | What happens when a **human** answers: `skip` (default - polite notice, no message), `forward` (transfer to `humanForward`, a phone number), or `sip` (transfer to a SIP endpoint such as **Vonage Contact Center**). Machines always get the voicemail drop. |
 | `sipUri` + `sipHeaders` | The SIP endpoint and custom INVITE headers (e.g. `X-NVM-*` for VCC agent routing and CRM screen pop). Header **values** support per-contact templates: `{{whoId}}`, `{{number}}`, `{{name}}`, `{{runId}}`, `{{legId}}`. |
 | `resultWebhook` | HTTPS URL on your side. Every call outcome is POSTed as `{event:"call_result", runId, legId, number, name, whoId, outcome, callUuid, messageId, at}` - outcomes include `machine_message_dropped`, `human_transferred`, `human_skipped`, `no_answer`, `busy`, `failed`, `transfer_failed` - plus a final `{event:"run_completed", counts}`. Keeps CRM writes (e.g. a Salesforce custom object) entirely on your side. |
+
+**Caller number(s) - `from`:** one Vonage number, or several (comma-separated string, or an array) to spread a run across a **number pool**. Concurrency places that many simultaneous calls; with one number they all originate from it, with a pool the calls round-robin across the numbers (useful for scaling past a single number's throughput). Defaults to `VONAGE_FROM`.
 
 **Webhook security (optional):** set `VONAGE_SIGNATURE_SECRET` to your Vonage application's signature secret and the app verifies the signed JWT on every incoming Voice event (spoofed events are dropped).
 

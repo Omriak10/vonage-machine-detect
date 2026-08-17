@@ -107,8 +107,17 @@ button:disabled{opacity:.4;cursor:default}
   </div>
 
   <div id="multi" class="hide">
-    <label>Numbers to call (one per line)</label>
-    <textarea id="numbers" placeholder="447700900461&#10;447700900462&#10;447700900463"></textarea>
+    <label>Saved list</label>
+    <select id="listSel" onchange="listPick()"><option value="">- none - type or upload below -</option></select>
+    <div class="hint">Reuse a saved list, or build one below and save it for next time.</div>
+    <label>Numbers to call</label>
+    <textarea id="numbers" placeholder="One per line. CSV allowed: number,name,salesforceId&#10;447700900461,Jane Doe&#10;447700900462,John Roe"></textarea>
+    <div class="row" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:-8px 0 14px">
+      <button class="ghost small" onclick="document.getElementById('csv').click()">&#8593; Upload CSV</button>
+      <input id="listName" placeholder="Save this list as..." style="flex:1;min-width:150px;margin:0;font-size:13px;padding:9px 12px">
+      <button class="ghost small" onclick="saveList()">Save list</button>
+      <input id="csv" type="file" accept=".csv,text/csv,text/plain" class="hide" onchange="uploadCsv(this.files[0])">
+    </div>
     <div class="hint" id="listSrc">Or load a list from Salesforce above.</div>
     <label>Voicemail message</label>
     <select id="msgSel"><option value="">Automatic / default message</option></select>
@@ -147,9 +156,9 @@ button:disabled{opacity:.4;cursor:default}
     </div>
   </div>
 
-  <label>Caller number</label>
+  <label>Caller number(s)</label>
   <input id="from" type="tel" value="" placeholder="your Vonage number" autocomplete="off">
-  <div class="hint">Must be a Vonage number on this account.</div>
+  <div class="hint">A Vonage number on this account. Concurrency places that many calls at once from it; enter several comma-separated to spread the run across a number pool.</div>
 
   <label class="chk" id="logChkWrap" style="display:none"><input type="checkbox" id="logSf"> Log results to Salesforce</label>
 
@@ -177,6 +186,45 @@ function humanChanged() {
   const v = el('humanAct').value;
   el('humanFwdWrap').classList.toggle('hide', v !== 'forward');
   el('humanSipWrap').classList.toggle('hide', v !== 'sip');
+}
+async function loadLists(selectId) {
+  try {
+    const d = await (await fetch('/api/lists')).json();
+    const sel = el('listSel');
+    sel.innerHTML = '<option value="">- none - type or upload below -</option>';
+    (d.lists || []).forEach((l) => { const o = document.createElement('option'); o.value = l.id; o.textContent = l.name + ' (' + l.count + ')'; sel.appendChild(o); });
+    if (selectId) sel.value = selectId;
+  } catch (e) {}
+}
+async function listPick() {
+  const id = el('listSel').value;
+  if (!id) return;
+  sfMembers = null;
+  try {
+    const d = await (await fetch('/api/list/registry/' + id)).json();
+    el('numbers').value = (d.members || []).map((m) => m.number + (m.name ? ',' + m.name : '')).join('\n');
+    el('listSrc').innerHTML = '<b>' + (d.members || []).length + '</b> numbers from saved list &ldquo;' + d.name.replace(/</g,'&lt;') + '&rdquo;.';
+  } catch (e) {}
+}
+async function uploadCsv(file) {
+  if (!file) return;
+  const text = await file.text();
+  el('numbers').value = text.trim();
+  el('listSel').value = '';
+  const rows = text.trim().split(String.fromCharCode(10)).filter(Boolean).length;
+  el('listSrc').innerHTML = 'Loaded <b>' + rows + '</b> rows from ' + file.name.replace(/</g,'&lt;') + '. Save it to reuse.';
+}
+async function saveList() {
+  const name = el('listName').value.trim();
+  if (!name) return alert('give the list a name');
+  const numbers = el('numbers').value;
+  if (!numbers.trim()) return alert('add some numbers first');
+  const r = await fetch('/api/list', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, numbers }) });
+  const d = await r.json();
+  if (!r.ok) return alert(d.error || 'save failed');
+  el('listName').value = '';
+  await loadLists(d.id);
+  el('listSrc').innerHTML = '<b>Saved</b> &ldquo;' + name.replace(/</g,'&lt;') + '&rdquo; (' + d.count + ') - selected for this run.';
 }
 async function loadMessages(selectId) {
   try {
@@ -255,8 +303,9 @@ async function place() {
   const logToSf = el('logSf') && el('logSf').checked;
   let body = { mode, from: el('from').value, logToSf };
   if (mode === 'drop') {
-    if (sfMembers && sfMembers.length) body.members = sfMembers;
-    else body.numbers = el('numbers').value.replace(/\/\/.*$/gm, '');
+    if (el('listSel').value) body.listId = el('listSel').value;
+    else if (sfMembers && sfMembers.length) body.members = sfMembers;
+    else body.numbers = el('numbers').value;
     if (el('msgSel').value) body.messageId = el('msgSel').value;
     body.concurrency = parseInt(el('conc').value, 10) || 1;
     body.humanAction = el('humanAct').value;
@@ -389,6 +438,6 @@ const barEls = document.querySelectorAll('#bars i');
 function setBars(peak) { barEls.forEach((b, i) => { const h = 3 + Math.max(0, peak * 20 - i * 1.5) * (1 + (i % 3)); b.style.height = Math.min(20, h) + 'px'; }); }
 
 async function loadConfig() { try { const d = await (await fetch('/api/config')).json(); if (d.from) el('from').value = d.from; } catch (e) {} }
-refreshMsg(); sfStatus(); loadConfig(); loadMessages();
+refreshMsg(); sfStatus(); loadConfig(); loadMessages(); loadLists();
 </script>
 </body></html>

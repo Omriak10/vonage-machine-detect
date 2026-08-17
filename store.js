@@ -19,7 +19,7 @@ const file = (id) => path.join(DIR, `run-${id}.json`);
 // what actually needs to survive a restart (not sockets/timers)
 function serialize(run) {
   return JSON.stringify({
-    id: run.id, mode: run.mode, from: run.from, logToSf: run.logToSf,
+    id: run.id, mode: run.mode, from: run.from, fromPool: run.fromPool, logToSf: run.logToSf,
     resultWebhook: run.resultWebhook, list: run.list, nextIdx: run.nextIdx,
     counts: run.counts, finished: run.finished, concurrency: run.concurrency,
     messageId: run.messageId, forward: run.forward, humanAction: run.humanAction,

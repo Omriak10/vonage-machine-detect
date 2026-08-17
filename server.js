@@ -117,6 +117,27 @@ const saveMsgIndex = () => { try { fs.writeFileSync(MSG_INDEX, JSON.stringify(me
 const AUTO_MESSAGE = "Hello, this is an automated message from Vonage. We tried to reach you but could not connect. "
   + "Please call us back at your earliest convenience. Thank you, and have a great day.";
 
+// ---------------------------------------------- saved call-list registry
+// Reusable named lists (one per campaign / call category), persisted so they
+// survive a restart. A list is [{number, whoId?, name?}]. Sources: paste, CSV
+// upload, Salesforce campaign, or the API.
+const LIST_INDEX = path.join(MSG_DIR, 'md-lists.json');
+let lists = {};   // id -> { name, members:[...], createdAt }
+try { if (fs.existsSync(LIST_INDEX)) lists = JSON.parse(fs.readFileSync(LIST_INDEX, 'utf8')) || {}; } catch {}
+const saveListIndex = () => { try { fs.writeFileSync(LIST_INDEX, JSON.stringify(lists)); } catch {} };
+// parse pasted text or CSV into members. CSV: number[,name[,whoId]] per line;
+// "// name" trailing comment (from the SF-loaded textarea) is stripped.
+function parseMembers(text) {
+  return String(text || '').split(/\r?\n/).map((line) => {
+    const l = line.replace(/\/\/.*$/, '').trim();
+    if (!l) return null;
+    const parts = l.split(/[,;\t]/).map((s) => s.trim());
+    const number = clean(parts[0]);
+    if (number.length < 7) return null;
+    return { number, name: parts[1] || undefined, whoId: parts[2] || undefined };
+  }).filter(Boolean);
+}
+
 // the NCCO played into a voicemail for a given run
 function dropNcco(run) {
   if (run.messageId && messages[run.messageId]) {
@@ -142,7 +163,11 @@ function tmpl(v, run, legId, m) {
 async function placeLeg(runId, legId) {
   const run = runs[runId];
   const m = run.list[legId];
-  const leg = { m, uuid: null, transferred: false, done: false, outcome: null };
+  // caller id: one number for the whole run, or round-robin across a pool.
+  // Concurrency places many simultaneous calls; with a single number they all
+  // go out from it, with a pool they spread across the numbers.
+  const fromNum = run.fromPool[legId % run.fromPool.length];
+  const leg = { m, from: fromNum, uuid: null, transferred: false, done: false, outcome: null };
   run.legs[legId] = leg; // active slot was reserved by launchNext
   const amd = {
     behavior: 'continue',
@@ -151,12 +176,12 @@ async function placeLeg(runId, legId) {
   };
   const { status, data } = await api('POST', 'https://api.nexmo.com/v1/calls', {
     to: [{ type: 'phone', number: m.number }],
-    from: { type: 'phone', number: run.from },
+    from: { type: 'phone', number: fromNum },
     advanced_machine_detection: amd,
     event_url: [HOST + '/webhooks/events?sid=' + runId + '&leg=' + legId],
     ncco: [
       // websocket leg keeps the call alive while AMD runs AND feeds live listen
-      { action: 'connect', from: run.from, endpoint: [{
+      { action: 'connect', from: fromNum, endpoint: [{
         type: 'websocket',
         uri: WS_HOST + '/socket/vonage?sid=' + runId,
         'content-type': 'audio/l16;rate=16000',
@@ -172,8 +197,8 @@ async function placeLeg(runId, legId) {
   persist(run);                       // durable: this number's call uuid is now known
   const who = m.name ? ` (${m.name})` : '';
   addLog(runId, run.mode === 'drop'
-    ? `[${legId + 1}/${run.list.length}] calling ${m.number}${who} from ${run.from}`
-    : `calling ${m.number}${who} from ${run.from} (AMD ${amd.mode}) - on machine, forward to ${run.forward}`);
+    ? `[${legId + 1}/${run.list.length}] calling ${m.number}${who} from ${fromNum}`
+    : `calling ${m.number}${who} from ${fromNum} (AMD ${amd.mode}) - on machine, forward to ${run.forward}`);
   return true;
 }
 
@@ -256,7 +281,12 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 app.post('/api/call', async (req, res) => {
   const b = req.body || {};
   const mode = ['detect', 'detect_beep', 'drop'].includes(b.mode) ? b.mode : 'detect';
-  const from = clean(b.from) || DEFAULT_FROM;
+  // caller id can be one number or several (comma-separated, or an array) to
+  // spread a run's calls across a number pool. Defaults to VONAGE_FROM.
+  const fromPool = (Array.isArray(b.from) ? b.from : String(b.from || '').split(','))
+    .map(clean).filter((n) => n.length >= 7);
+  if (!fromPool.length && DEFAULT_FROM) fromPool.push(clean(DEFAULT_FROM));
+  const from = fromPool[0] || DEFAULT_FROM;
   const logToSf = !!b.logToSf && sfdc.isConfigured();
   const runId = crypto.randomUUID().slice(0, 8);
   const resultWebhook = /^https?:\/\//.test(String(b.resultWebhook || '')) ? String(b.resultWebhook) : null;
@@ -266,7 +296,7 @@ app.post('/api/call', async (req, res) => {
     : { number: clean(x.number), whoId: x.whoId, name: x.name });
 
   const run = {
-    id: runId, mode, from, logToSf, resultWebhook,
+    id: runId, mode, from, fromPool, logToSf, resultWebhook,
     legs: {}, nextIdx: 0, active: 0, counts: {}, finished: false,
     createdAt: Date.now(),
   };
@@ -274,10 +304,14 @@ app.post('/api/call', async (req, res) => {
 
   if (mode === 'drop') {
     let list = [];
-    if (Array.isArray(b.members) && b.members.length) {
+    if (b.listId) {                                   // a saved list
+      const saved = lists[b.listId];
+      if (!saved) return res.status(400).json({ error: `unknown listId "${b.listId}" - see GET /api/lists` });
+      list = saved.members.map(toMember).filter((m) => m.number.length >= 7);
+    } else if (Array.isArray(b.members) && b.members.length) {
       list = b.members.map(toMember).filter((m) => m.number.length >= 7);
     } else {
-      list = String(b.numbers || '').split(/[\n,;]+/).map((n) => ({ number: clean(n) })).filter((m) => m.number.length >= 7);
+      list = parseMembers(b.numbers).map(toMember).filter((m) => m.number.length >= 7);
     }
     if (!list.length) return res.status(400).json({ error: 'enter at least one valid number in the list' });
     run.list = list;
@@ -299,7 +333,7 @@ app.post('/api/call', async (req, res) => {
     }
     runs[runId] = run;
     persist(run);
-    addLog(runId, `drop run started - ${list.length} number${list.length === 1 ? '' : 's'}, concurrency ${run.concurrency}, ${msgLabel(run)}`
+    addLog(runId, `drop run started - ${list.length} number${list.length === 1 ? '' : 's'}, concurrency ${run.concurrency} from ${fromPool.length === 1 ? fromPool[0] : fromPool.length + ' numbers'}, ${msgLabel(run)}`
       + (run.humanAction === 'sip' ? `, humans -> SIP agent` : run.humanAction === 'forward' ? `, humans -> ${run.humanForward}` : ', humans skipped')
       + (logToSf ? ', logging to Salesforce' : '') + (resultWebhook ? ', pushing results' : ''));
     launchNext(runId);
@@ -356,6 +390,39 @@ app.post('/api/message', express.raw({ type: '*/*', limit: '15mb' }), (req, res)
   addLog('msg', `default message saved (${Math.round(dropMessage.length / 1024)} KB)`, 'good');
   res.json({ ok: true, id: 'default', bytes: dropMessage.length });
 });
+// ------------------------------------------------- saved call lists
+// Save a reusable list. Body: { name, numbers } (paste/CSV text) or
+// { name, members:[{number,name?,whoId?}] }. Returns its id.
+app.post('/api/list', (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  let members = [];
+  if (Array.isArray(b.members)) members = b.members.map((m) => ({ number: clean(m.number), name: m.name, whoId: m.whoId })).filter((m) => m.number.length >= 7);
+  else members = parseMembers(b.numbers);
+  if (!members.length) return res.status(400).json({ error: 'no valid numbers - one per line, CSV number[,name[,whoId]]' });
+  const id = crypto.randomUUID().slice(0, 8);
+  lists[id] = { name, members, createdAt: Date.now() };
+  saveListIndex();
+  addLog('list', `saved list "${name}" (${members.length} numbers) - id ${id}`, 'good');
+  res.json({ ok: true, id, name, count: members.length });
+});
+app.get('/api/lists', (req, res) => res.json({
+  lists: Object.entries(lists).map(([id, l]) => ({ id, name: l.name, count: l.members.length, createdAt: l.createdAt })),
+}));
+app.get('/api/list/registry/:id', (req, res) => {
+  const l = lists[req.params.id];
+  if (!l) return res.status(404).json({ error: 'unknown list id' });
+  res.json({ id: req.params.id, name: l.name, members: l.members });
+});
+app.delete('/api/list/:id', (req, res) => {
+  if (!lists[req.params.id]) return res.status(404).json({ error: 'unknown list id' });
+  const nm = lists[req.params.id].name;
+  delete lists[req.params.id]; saveListIndex();
+  addLog('list', `deleted list "${nm}"`);
+  res.json({ ok: true });
+});
+
 app.get('/api/messages', (req, res) => res.json({
   default: { recorded: !!dropMessage, bytes: dropMessage ? dropMessage.length : 0, auto: AUTO_MESSAGE },
   messages: Object.entries(messages).map(([id, m]) => ({ id, name: m.name, bytes: m.bytes })),
@@ -435,7 +502,7 @@ app.post('/webhooks/events', async (req, res) => {
       const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
         action: 'transfer',
         destination: { type: 'ncco', ncco: [
-          { action: 'connect', from: run.from, timeout: 60,
+          { action: 'connect', from: leg.from || run.from, timeout: 60,
             endpoint: [{ type: 'sip', uri: run.sipUri, headers }] },
         ] },
       });
@@ -454,7 +521,7 @@ app.post('/webhooks/events', async (req, res) => {
       const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
         action: 'transfer',
         destination: { type: 'ncco', ncco: [
-          { action: 'connect', from: run.from, timeout: 60, endpoint: [{ type: 'phone', number: run.humanForward }] },
+          { action: 'connect', from: leg.from || run.from, timeout: 60, endpoint: [{ type: 'phone', number: run.humanForward }] },
         ] },
       });
       leg.outcome = r.status < 300 ? 'human_transferred' : 'transfer_failed';
@@ -504,7 +571,7 @@ app.post('/webhooks/events', async (req, res) => {
     const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
       action: 'transfer',
       destination: { type: 'ncco', ncco: [
-        { action: 'connect', from: run.from, timeout: 45, endpoint: [{ type: 'phone', number: run.forward }] },
+        { action: 'connect', from: leg.from || run.from, timeout: 45, endpoint: [{ type: 'phone', number: run.forward }] },
       ] },
     });
     leg.outcome = r.status < 300 ? 'machine_transferred' : 'transfer_failed';
@@ -543,7 +610,7 @@ app.get('/api/config', (req, res) => res.json({ from: DEFAULT_FROM }));
 // Everything the app is made of, so a team can lift it into their own stack
 // (no VCR required). Secrets are NEVER part of the source - config is env only.
 const SOURCE_FILES = [
-  'server.js', 'salesforce.js', 'store.js', 'public/index.html',
+  'server.js', 'salesforce.js', 'store.js', 'public/index.html', 'public/code.html',
   'package.json', '.env.example', 'vcr.yml.example', 'README.md', 'IMPLEMENTATION.md',
 ];
 const readSource = () => SOURCE_FILES.map((f) => {
@@ -601,6 +668,7 @@ async function reconcile() {
     if (r.finished) { store.remove(id); continue; }
     // rehydrate runtime fields
     r.active = 0; r.cur = null;
+    if (!Array.isArray(r.fromPool) || !r.fromPool.length) r.fromPool = [r.from || DEFAULT_FROM];
     runs[id] = r;
     addLog(id, `resuming run after restart - ${Object.keys(r.legs).length} dialled of ${r.list.length}, ${r.nextIdx} claimed`, 'warn');
 
