@@ -3,23 +3,43 @@
 // Modes:
 //   detect       - transfer to the forward number as soon as a machine answers
 //   detect_beep  - same, but transfer after the voicemail beep
-//   drop         - VOICEMAIL DROP: dial a LIST of numbers; when a machine
-//                  answers, play the operator's recorded message after the
-//                  beep, hang up, and dial the next number automatically.
-//                  Humans get a short notice, never the drop.
+//   drop         - dial a LIST of numbers with configurable concurrency; when a
+//                  machine answers, play a (named) voicemail message after the
+//                  beep and move on. When a HUMAN answers: skip (default),
+//                  transfer to a phone number, or transfer to a SIP endpoint
+//                  (e.g. Vonage Contact Center) with custom headers.
 //
 // Live listen: every call leg is bridged to a websocket (audio/l16, 16 kHz),
-// rebroadcast to any browser listening on /socket/listen - so you can hear
-// the far side (greeting, machine, beep) straight from this page.
+// rebroadcast to any browser listening on /socket/listen.
 //
-//   GET  /                  - console UI
-//   POST /api/call          - {mode, to|numbers[], forward?, from?}
-//   POST /api/message       - upload the recorded drop message (WAV body)
-//   GET  /message.wav       - the stored drop message (fetched by Vonage)
-//   GET  /api/log?since=    - event timeline for the UI
-//   POST /webhooks/events   - Voice API event webhook (per-call event_url)
-//   WS   /socket/vonage?sid - call audio in from Vonage
-//   WS   /socket/listen?sid - browser listeners
+//   GET  /                    - console UI
+//   POST /api/call            - start a call / a run (see below)
+//   GET  /api/run/:id         - run status + per-leg outcomes
+//   POST /api/message         - upload a voicemail message (?name= to store as
+//                               a named message; without name = the default)
+//   GET  /api/messages        - list named messages
+//   DELETE /api/message/:id   - delete a named message
+//   GET  /message.wav         - default message (fetched by Vonage)
+//   GET  /message/:id.wav     - named message (fetched by Vonage)
+//   GET  /api/log?since=      - event timeline for the UI
+//   POST /webhooks/events     - Voice API event webhook (per-leg event_url)
+//   WS   /socket/vonage       - call audio in from Vonage
+//   WS   /socket/listen       - browser listeners
+//
+// POST /api/call body:
+//   mode           detect | detect_beep | drop
+//   to, forward    transfer modes: single number + forward-on-machine number
+//   numbers        drop: newline/comma-separated list, or:
+//   members        drop: [{number, whoId?, name?}] (e.g. from /api/sf/list/:id)
+//   messageId      drop: which named message to play (default: default/auto)
+//   concurrency    drop: simultaneous calls, 1-10 (default 1)
+//   humanAction    drop: skip (default) | forward | sip
+//   humanForward   drop + humanAction=forward: phone number for live answers
+//   sipUri         drop + humanAction=sip: sip:...@... endpoint (e.g. VCC)
+//   sipHeaders     drop + humanAction=sip: {header: value} - values support
+//                  {{whoId}} {{number}} {{name}} {{runId}} {{legId}} templates
+//   resultWebhook  optional https URL - every call outcome is POSTed there
+//   from, logToSf  as before
 const express = require('express');
 const http = require('http');
 const fs = require('fs');
@@ -39,6 +59,8 @@ const APP_ID = process.env.VONAGE_APPLICATION_ID || '';        // your Vonage Vo
 const HOST = (process.env.PUBLIC_BASE || `http://localhost:${PORT}`).replace(/\/$/, ''); // this app's public https base
 const WS_HOST = HOST.replace(/^http/, 'ws');
 const DEFAULT_FROM = process.env.VONAGE_FROM || '';            // a Vonage voice number on your account (caller id)
+// optional: set your application's signature secret to verify event webhooks
+const SIGNATURE_SECRET = process.env.VONAGE_SIGNATURE_SECRET || '';
 // private key: env var (PEM) or a file path, default ./private.key
 const PRIVATE_KEY = process.env.VONAGE_PRIVATE_KEY
   ? process.env.VONAGE_PRIVATE_KEY.replace(/\\n/g, '\n')
@@ -60,85 +82,162 @@ const api = async (method, url, body) => {
 };
 
 // ---------------------------------------------------------------- state
-const calls = {};   // sid -> session (single-operator demo tool)
+const runs = {};    // runId -> run (see header). In-memory by design: for
+                    // production, persist runs + messages to a durable store
+                    // and resume from the last unprocessed member on restart.
 const log = [];
 const addLog = (sid, msg, kind = 'info') => {
   log.push({ t: Date.now(), sid, msg, kind });
-  if (log.length > 500) log.splice(0, log.length - 500);
+  if (log.length > 600) log.splice(0, log.length - 600);
   console.log(`[${sid}] ${msg}`);
 };
 const clean = (n) => String(n || '').replace(/[^\d]/g, '');
 
-// the operator's recorded voicemail-drop message (survives within the instance).
-// optional: if nothing is recorded, drop mode falls back to AUTO_MESSAGE (TTS).
-const MSG_PATH = path.join(os.tmpdir(), 'drop-message.wav');
+// ------------------------------------------------- voicemail message registry
+// Named messages (per campaign / call category) + one unnamed default.
+// Persisted to the instance's tmp dir so a process restart keeps them.
+const MSG_DIR = os.tmpdir();
+const MSG_INDEX = path.join(MSG_DIR, 'md-messages.json');
+const MSG_PATH = path.join(MSG_DIR, 'drop-message.wav'); // legacy default
 let dropMessage = fs.existsSync(MSG_PATH) ? fs.readFileSync(MSG_PATH) : null;
+let messages = {};  // id -> { name, bytes, file }
+try {
+  if (fs.existsSync(MSG_INDEX)) {
+    const idx = JSON.parse(fs.readFileSync(MSG_INDEX, 'utf8'));
+    for (const [id, m] of Object.entries(idx)) {
+      if (fs.existsSync(m.file)) messages[id] = m;
+    }
+  }
+} catch {}
+const saveMsgIndex = () => { try { fs.writeFileSync(MSG_INDEX, JSON.stringify(messages)); } catch {} };
+
 const AUTO_MESSAGE = "Hello, this is an automated message from Vonage. We tried to reach you but could not connect. "
   + "Please call us back at your earliest convenience. Thank you, and have a great day.";
 
-// the NCCO played into a voicemail: recorded WAV if we have one, else spoken auto message
-const dropNcco = () => dropMessage
-  ? [{ action: 'stream', streamUrl: [HOST + '/message.wav'] }]
-  : [{ action: 'talk', text: AUTO_MESSAGE, language: 'en-US', style: 2 }];
+// the NCCO played into a voicemail for a given run
+function dropNcco(run) {
+  if (run.messageId && messages[run.messageId]) {
+    return [{ action: 'stream', streamUrl: [HOST + '/message/' + run.messageId + '.wav'] }];
+  }
+  if (dropMessage) return [{ action: 'stream', streamUrl: [HOST + '/message.wav'] }];
+  return [{ action: 'talk', text: AUTO_MESSAGE, language: 'en-US', style: 2 }];
+}
+const msgLabel = (run) => run.messageId && messages[run.messageId]
+  ? `message "${messages[run.messageId].name}"` : (dropMessage ? 'default recorded message' : 'automatic message');
 
 // ---------------------------------------------------------------- calling
-// every call targets a "member": { number, whoId?, name? }. Drop mode walks a
-// list of them; transfer modes have a single member. whoId (from Salesforce)
-// enables activity logging.
-async function placeCall(sid) {
-  const c = calls[sid];
-  const m = c.mode === 'drop' ? c.list[c.idx] : c.single;
-  c.cur = m;
+// A run dials members as legs. Transfer modes are a run with a single member.
+function tmpl(v, run, legId, m) {
+  return String(v)
+    .replace(/\{\{\s*whoId\s*\}\}/g, m.whoId || '')
+    .replace(/\{\{\s*number\s*\}\}/g, m.number || '')
+    .replace(/\{\{\s*name\s*\}\}/g, m.name || '')
+    .replace(/\{\{\s*runId\s*\}\}/g, run.id)
+    .replace(/\{\{\s*legId\s*\}\}/g, String(legId));
+}
+
+async function placeLeg(runId, legId) {
+  const run = runs[runId];
+  const m = run.list[legId];
+  const leg = { m, uuid: null, transferred: false, done: false, outcome: null };
+  run.legs[legId] = leg; // active slot was reserved by launchNext
   const amd = {
     behavior: 'continue',
-    mode: c.mode === 'detect' ? 'detect' : 'detect_beep', // drops wait for the beep
+    mode: run.mode === 'detect' ? 'detect' : 'detect_beep', // drops wait for the beep
     beep_timeout: 45, // mandatory for AMD (30-120s) whatever the mode
   };
   const { status, data } = await api('POST', 'https://api.nexmo.com/v1/calls', {
     to: [{ type: 'phone', number: m.number }],
-    from: { type: 'phone', number: c.from },
+    from: { type: 'phone', number: run.from },
     advanced_machine_detection: amd,
-    event_url: [HOST + '/webhooks/events?sid=' + sid],
+    event_url: [HOST + '/webhooks/events?sid=' + runId + '&leg=' + legId],
     ncco: [
       // websocket leg keeps the call alive while AMD runs AND feeds live listen
-      { action: 'connect', from: c.from, endpoint: [{
+      { action: 'connect', from: run.from, endpoint: [{
         type: 'websocket',
-        uri: WS_HOST + '/socket/vonage?sid=' + sid,
+        uri: WS_HOST + '/socket/vonage?sid=' + runId,
         'content-type': 'audio/l16;rate=16000',
       }] },
     ],
   });
   if (status >= 300 || !data.uuid) {
-    addLog(sid, `call to ${m.number} FAILED: ` + JSON.stringify(data).slice(0, 250), 'bad');
-    if (c.mode === 'drop') nextInList(sid);
+    addLog(runId, `call to ${m.number} FAILED: ` + JSON.stringify(data).slice(0, 250), 'bad');
+    finishLeg(runId, legId, 'failed', JSON.stringify(data).slice(0, 200));
     return false;
   }
-  c.uuid = data.uuid; c.transferred = false; c.done = false;
+  leg.uuid = data.uuid;
   const who = m.name ? ` (${m.name})` : '';
-  addLog(sid, c.mode === 'drop'
-    ? `[${c.idx + 1}/${c.list.length}] calling ${m.number}${who} from ${c.from} - drop message on machine`
-    : `calling ${m.number}${who} from ${c.from} (AMD ${amd.mode}) - on machine, forward to ${c.forward}`);
+  addLog(runId, run.mode === 'drop'
+    ? `[${legId + 1}/${run.list.length}] calling ${m.number}${who} from ${run.from}`
+    : `calling ${m.number}${who} from ${run.from} (AMD ${amd.mode}) - on machine, forward to ${run.forward}`);
   return true;
 }
 
-function nextInList(sid) {
-  const c = calls[sid];
-  if (c.mode !== 'drop') return;
-  c.idx++;
-  if (c.idx >= c.list.length) {
-    addLog(sid, `list finished - ${c.dropped} message${c.dropped === 1 ? '' : 's'} left on ${c.list.length} number${c.list.length === 1 ? '' : 's'}`, 'good');
-    return;
-  }
-  setTimeout(() => placeCall(sid), 1500);
+// a leg reached a terminal outcome: record it, push it, refill the dialler
+function finishLeg(runId, legId, outcome, detail) {
+  const run = runs[runId];
+  const leg = run.legs[legId];
+  if (!leg || leg.finished) return;
+  leg.finished = true; leg.done = true; leg.outcome = outcome;
+  run.active = Math.max(0, run.active - 1);
+  run.counts[outcome] = (run.counts[outcome] || 0) + 1;
+  pushResult(run, legId, outcome, detail);
+  launchNext(runId);
 }
 
-// fire-and-forget Salesforce activity log for the current member
-function logSf(sid, kind, detail) {
-  const c = calls[sid];
-  if (!c || !c.logToSf || !c.cur || !c.cur.whoId) return;
-  sfdc.logActivity(c.cur.whoId, kind, detail)
-    .then((r) => { if (r && r.id) addLog(sid, `logged to Salesforce (${kind === 'machine' ? 'machine detected' : 'live conversation'}) on ${c.cur.name || c.cur.whoId}`, 'info'); })
-    .catch((e) => addLog(sid, 'Salesforce log failed: ' + e.message, 'bad'));
+function launchNext(runId) {
+  const run = runs[runId];
+  if (run.mode !== 'drop') { maybeFinishRun(runId); return; }
+  let batch = 0;
+  while (run.active < run.concurrency && run.nextIdx < run.list.length) {
+    const legId = run.nextIdx++;
+    run.active++; // reserve the slot now; finishLeg releases it
+    setTimeout(() => placeLeg(runId, legId), 350 * batch++); // stagger to stay under account CPS
+  }
+  maybeFinishRun(runId);
+}
+
+function maybeFinishRun(runId) {
+  const run = runs[runId];
+  if (run.finished || run.active > 0 || run.nextIdx < run.list.length) return;
+  // any legs still not terminal? (events may still be in flight)
+  if (Object.values(run.legs).some((l) => !l.finished)) return;
+  run.finished = true;
+  const c = run.counts;
+  if (run.mode === 'drop') {
+    addLog(runId, `run finished - ${c.machine_message_dropped || 0} dropped, ${(c.human_transferred || 0)} transferred, `
+      + `${c.human_skipped || 0} humans skipped, ${c.no_answer || 0} no answer, ${c.failed || 0} failed of ${run.list.length}`, 'good');
+  }
+  pushResult(run, null, 'run_completed', null);
+}
+
+// fire-and-forget outcome push to the client's webhook
+function pushResult(run, legId, outcome, detail) {
+  if (!run.resultWebhook) return;
+  const leg = legId != null ? run.legs[legId] : null;
+  const body = leg ? {
+    event: 'call_result', runId: run.id, legId, mode: run.mode,
+    number: leg.m.number, name: leg.m.name || null, whoId: leg.m.whoId || null,
+    outcome, detail: detail || null, callUuid: leg.uuid, messageId: run.messageId || null,
+    at: new Date().toISOString(),
+  } : {
+    event: 'run_completed', runId: run.id, mode: run.mode, total: run.list.length,
+    counts: run.counts, at: new Date().toISOString(),
+  };
+  fetch(run.resultWebhook, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
+  }).catch((e) => addLog(run.id, 'result webhook failed: ' + e.message, 'bad'));
+}
+
+// fire-and-forget Salesforce activity log for a leg's member
+function logSf(runId, legId, kind, detail) {
+  const run = runs[runId];
+  const m = run && run.legs[legId] && run.legs[legId].m;
+  if (!run || !run.logToSf || !m || !m.whoId) return;
+  sfdc.logActivity(m.whoId, kind, detail)
+    .then((r) => { if (r && r.id) addLog(runId, `logged to Salesforce (${kind === 'machine' ? 'machine detected' : 'live conversation'}) on ${m.name || m.whoId}`, 'info'); })
+    .catch((e) => addLog(runId, 'Salesforce log failed: ' + e.message, 'bad'));
 }
 
 // ---------------------------------------------------------------- routes
@@ -146,128 +245,259 @@ app.get('/_/health', (req, res) => res.status(200).send('OK'));
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 app.post('/api/call', async (req, res) => {
-  const mode = ['detect', 'detect_beep', 'drop'].includes(req.body.mode) ? req.body.mode : 'detect';
-  const from = clean(req.body.from) || DEFAULT_FROM;
-  const logToSf = !!req.body.logToSf && sfdc.isConfigured();
-  const sid = crypto.randomUUID().slice(0, 8);
+  const b = req.body || {};
+  const mode = ['detect', 'detect_beep', 'drop'].includes(b.mode) ? b.mode : 'detect';
+  const from = clean(b.from) || DEFAULT_FROM;
+  const logToSf = !!b.logToSf && sfdc.isConfigured();
+  const runId = crypto.randomUUID().slice(0, 8);
+  const resultWebhook = /^https?:\/\//.test(String(b.resultWebhook || '')) ? String(b.resultWebhook) : null;
 
-  // members can come from Salesforce (array of {number, whoId, name}) or from
-  // the pasted textarea (plain numbers)
   const toMember = (x) => (typeof x === 'string'
     ? { number: clean(x) }
     : { number: clean(x.number), whoId: x.whoId, name: x.name });
 
+  const run = {
+    id: runId, mode, from, logToSf, resultWebhook,
+    legs: {}, nextIdx: 0, active: 0, counts: {}, finished: false,
+  };
+
   if (mode === 'drop') {
     let list = [];
-    if (Array.isArray(req.body.members) && req.body.members.length) {
-      list = req.body.members.map(toMember).filter((m) => m.number.length >= 7);
+    if (Array.isArray(b.members) && b.members.length) {
+      list = b.members.map(toMember).filter((m) => m.number.length >= 7);
     } else {
-      list = String(req.body.numbers || '').split(/[\n,;]+/).map((n) => ({ number: clean(n) })).filter((m) => m.number.length >= 7);
+      list = String(b.numbers || '').split(/[\n,;]+/).map((n) => ({ number: clean(n) })).filter((m) => m.number.length >= 7);
     }
     if (!list.length) return res.status(400).json({ error: 'enter at least one valid number in the list' });
-    calls[sid] = { mode, list, idx: 0, from, dropped: 0, logToSf };
-    addLog(sid, `voicemail drop started - ${list.length} number${list.length === 1 ? '' : 's'}, `
-      + (dropMessage ? 'your recorded message' : 'automatic message')
-      + (logToSf ? ', logging to Salesforce' : ''));
-  } else {
-    const to = clean(req.body.to), forward = clean(req.body.forward);
-    if (to.length < 7) return res.status(400).json({ error: 'enter a valid number to call' });
-    if (forward.length < 7) return res.status(400).json({ error: 'enter a valid forward number' });
-    const single = req.body.member ? toMember(req.body.member) : { number: to };
-    calls[sid] = { mode, single, forward, from, logToSf };
+    run.list = list;
+    run.concurrency = Math.max(1, Math.min(10, parseInt(b.concurrency, 10) || 1));
+    run.messageId = b.messageId && messages[b.messageId] ? String(b.messageId) : null;
+    if (b.messageId && !run.messageId && b.messageId !== 'default') {
+      return res.status(400).json({ error: `unknown messageId "${b.messageId}" - see GET /api/messages` });
+    }
+    // what to do when a HUMAN answers
+    run.humanAction = ['skip', 'forward', 'sip'].includes(b.humanAction) ? b.humanAction : 'skip';
+    if (run.humanAction === 'forward') {
+      run.humanForward = clean(b.humanForward);
+      if (run.humanForward.length < 7) return res.status(400).json({ error: 'humanForward number required for humanAction=forward' });
+    }
+    if (run.humanAction === 'sip') {
+      run.sipUri = String(b.sipUri || '').trim();
+      if (!/^sips?:/.test(run.sipUri)) return res.status(400).json({ error: 'sipUri (sip:...) required for humanAction=sip' });
+      run.sipHeaders = (b.sipHeaders && typeof b.sipHeaders === 'object' && !Array.isArray(b.sipHeaders)) ? b.sipHeaders : {};
+    }
+    runs[runId] = run;
+    addLog(runId, `drop run started - ${list.length} number${list.length === 1 ? '' : 's'}, concurrency ${run.concurrency}, ${msgLabel(run)}`
+      + (run.humanAction === 'sip' ? `, humans -> SIP agent` : run.humanAction === 'forward' ? `, humans -> ${run.humanForward}` : ', humans skipped')
+      + (logToSf ? ', logging to Salesforce' : '') + (resultWebhook ? ', pushing results' : ''));
+    launchNext(runId);
+    return res.json({ ok: true, sid: runId, runId, legs: list.length, concurrency: run.concurrency });
   }
 
-  const ok = await placeCall(sid);
-  if (!ok && calls[sid].mode !== 'drop') return res.status(502).json({ error: 'Vonage rejected the call - see the log', sid });
-  res.json({ ok: true, sid });
+  // transfer modes - a single-member run
+  const to = clean(b.to), forward = clean(b.forward);
+  if (to.length < 7) return res.status(400).json({ error: 'enter a valid number to call' });
+  if (forward.length < 7) return res.status(400).json({ error: 'enter a valid forward number' });
+  run.list = [b.member ? toMember(b.member) : { number: to }];
+  run.forward = forward;
+  run.concurrency = 1;
+  runs[runId] = run;
+  run.nextIdx = 1;
+  run.active = 1;
+  const ok = await placeLeg(runId, 0);
+  if (!ok) return res.status(502).json({ error: 'Vonage rejected the call - see the log', sid: runId });
+  res.json({ ok: true, sid: runId, runId });
 });
 
-// browser-recorded WAV (already 16-bit PCM, encoded client-side)
+// run status - per-leg outcomes for polling from the client's system
+app.get('/api/run/:id', (req, res) => {
+  const run = runs[req.params.id];
+  if (!run) return res.status(404).json({ error: 'unknown run' });
+  res.json({
+    runId: run.id, mode: run.mode, total: run.list.length, dialled: run.nextIdx,
+    active: run.active, finished: run.finished, counts: run.counts,
+    legs: Object.entries(run.legs).map(([id, l]) => ({
+      legId: Number(id), number: l.m.number, name: l.m.name || null, whoId: l.m.whoId || null,
+      callUuid: l.uuid, outcome: l.outcome, finished: !!l.finished,
+    })),
+  });
+});
+
+// ------------------------------------------------- voicemail message routes
+// POST ?name=  -> stored as a NAMED message (returns its id)
+// POST         -> replaces the unnamed default (back-compat)
 app.post('/api/message', express.raw({ type: '*/*', limit: '15mb' }), (req, res) => {
   if (!req.body || req.body.length < 1000) return res.status(400).json({ error: 'empty recording' });
+  const name = String(req.query.name || '').trim();
+  if (name) {
+    const id = crypto.randomUUID().slice(0, 8);
+    const file = path.join(MSG_DIR, `md-msg-${id}.wav`);
+    try { fs.writeFileSync(file, req.body); } catch (e) { return res.status(500).json({ error: e.message }); }
+    messages[id] = { name, bytes: req.body.length, file };
+    saveMsgIndex();
+    addLog('msg', `named message "${name}" saved (${Math.round(req.body.length / 1024)} KB) - id ${id}`, 'good');
+    return res.json({ ok: true, id, name, bytes: req.body.length });
+  }
   dropMessage = req.body;
   try { fs.writeFileSync(MSG_PATH, dropMessage); } catch {}
-  addLog('msg', `drop message saved (${Math.round(dropMessage.length / 1024)} KB)`, 'good');
-  res.json({ ok: true, bytes: dropMessage.length });
+  addLog('msg', `default message saved (${Math.round(dropMessage.length / 1024)} KB)`, 'good');
+  res.json({ ok: true, id: 'default', bytes: dropMessage.length });
 });
-app.get('/message.wav', (req, res) => {
-  if (!dropMessage) return res.status(404).end();
-  res.set('Content-Type', 'audio/wav').send(dropMessage);
-});
+app.get('/api/messages', (req, res) => res.json({
+  default: { recorded: !!dropMessage, bytes: dropMessage ? dropMessage.length : 0, auto: AUTO_MESSAGE },
+  messages: Object.entries(messages).map(([id, m]) => ({ id, name: m.name, bytes: m.bytes })),
+}));
 app.get('/api/message', (req, res) => res.json({ recorded: !!dropMessage, bytes: dropMessage ? dropMessage.length : 0, auto: AUTO_MESSAGE }));
+app.delete('/api/message/:id', (req, res) => {
+  const m = messages[req.params.id];
+  if (!m) return res.status(404).json({ error: 'unknown message id' });
+  try { fs.existsSync(m.file) && fs.unlinkSync(m.file); } catch {}
+  delete messages[req.params.id];
+  saveMsgIndex();
+  addLog('msg', `named message "${m.name}" deleted`);
+  res.json({ ok: true });
+});
 app.delete('/api/message', (req, res) => {
   dropMessage = null;
   try { fs.existsSync(MSG_PATH) && fs.unlinkSync(MSG_PATH); } catch {}
   addLog('msg', 'reverted to automatic message', 'info');
   res.json({ ok: true });
 });
+app.get('/message.wav', (req, res) => {
+  if (!dropMessage) return res.status(404).end();
+  res.set('Content-Type', 'audio/wav').send(dropMessage);
+});
+app.get('/message/:id.wav', (req, res) => {
+  const m = messages[req.params.id];
+  if (!m || !fs.existsSync(m.file)) return res.status(404).end();
+  res.set('Content-Type', 'audio/wav').send(fs.readFileSync(m.file));
+});
 
-// per-call event webhook - the whole detect/act brain lives here
+// ------------------------------------------------------- event webhook
+// Optional spoofing protection: set VONAGE_SIGNATURE_SECRET (your application's
+// signature secret) and every event must carry a valid signed JWT whose
+// payload_hash matches the body.
+function eventSignatureOk(req) {
+  if (!SIGNATURE_SECRET) return true; // verification off
+  try {
+    const tok = (req.get('Authorization') || '').replace(/^Bearer\s+/i, '');
+    const payload = jwt.verify(tok, SIGNATURE_SECRET, { algorithms: ['HS256'] });
+    const hash = crypto.createHash('sha256').update(JSON.stringify(req.body)).digest('hex');
+    return !payload.payload_hash || payload.payload_hash === hash;
+  } catch { return false; }
+}
+
+// per-leg event webhook - the whole detect/act brain lives here
 app.post('/webhooks/events', async (req, res) => {
   res.status(200).end();
-  const sid = req.query.sid || '?';
+  const runId = req.query.sid || '?';
+  const legId = Number(req.query.leg || 0);
   const ev = req.body || {};
-  const c = calls[sid];
+  const run = runs[runId];
+  const leg = run && run.legs[legId];
   const status = ev.status, sub = ev.sub_state;
 
-  if (status && !['machine', 'human'].includes(status)) addLog(sid, 'status: ' + status);
-  if (!c) return;
+  if (!eventSignatureOk(req)) { addLog(runId, 'event with BAD signature ignored', 'bad'); return; }
+  if (status && !['machine', 'human'].includes(status)) addLog(runId, `leg ${legId + 1} status: ${status}`);
+  if (!run || !leg) return;
 
-  if (status === 'completed') {
-    const wasDone = c.done;
-    c.done = true;
-    if (c.mode === 'drop') { if (!wasDone) addLog(sid, 'no answer / ended before detection'); nextInList(sid); }
+  // ANY terminal status frees the leg - a failed/busy/unanswered call never
+  // sends 'completed', and treating only 'completed' as terminal stalls a slot.
+  const TERMINAL = ['completed', 'failed', 'rejected', 'busy', 'unanswered', 'timeout', 'cancelled'];
+  if (TERMINAL.includes(status)) {
+    if (!leg.done && status === 'completed') addLog(runId, `leg ${legId + 1} - ended before detection`);
+    finishLeg(runId, legId, leg.outcome || (status === 'completed' ? (leg.done ? 'completed' : 'no_answer') : status));
     return;
   }
-  if (c.done) return;
+  if (leg.done) return;
 
   if (status === 'human') {
-    addLog(sid, 'HUMAN detected - live conversation' + (c.mode === 'drop' ? ' (skipping, no message left)' : ''), 'good');
-    c.done = true;
-    logSf(sid, 'live', 'A live conversation happened - a person answered' + (c.mode === 'drop' ? ' (no voicemail left).' : '.'));
-    // transfer modes forward the human? No - forwarding is machine-only. Human
-    // is the person we wanted, so leave them a short notice and end.
-    await api('PUT', 'https://api.nexmo.com/v1/calls/' + c.uuid, {
+    leg.done = true;
+    if (run.mode === 'drop' && run.humanAction === 'sip') {
+      // HUMAN -> live agent on a SIP endpoint (e.g. Vonage Contact Center),
+      // custom headers carry agent id / CRM record id for the screen pop.
+      const headers = {};
+      for (const [k, v] of Object.entries(run.sipHeaders || {})) headers[k] = tmpl(v, run, legId, leg.m);
+      addLog(runId, `HUMAN detected - transferring to agent (${run.sipUri})`, 'good');
+      const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
+        action: 'transfer',
+        destination: { type: 'ncco', ncco: [
+          { action: 'connect', from: run.from, timeout: 60,
+            endpoint: [{ type: 'sip', uri: run.sipUri, headers }] },
+        ] },
+      });
+      if (r.status < 300) {
+        leg.outcome = 'human_transferred';
+        addLog(runId, `leg ${legId + 1} TRANSFERRED to SIP agent`, 'good');
+        logSf(runId, legId, 'live', 'A person answered; call transferred to a live agent.');
+      } else {
+        leg.outcome = 'transfer_failed';
+        addLog(runId, `leg ${legId + 1} SIP transfer FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
+      }
+      return; // 'completed' fires when the bridged call ends
+    }
+    if (run.mode === 'drop' && run.humanAction === 'forward') {
+      addLog(runId, `HUMAN detected - transferring to ${run.humanForward}`, 'good');
+      const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
+        action: 'transfer',
+        destination: { type: 'ncco', ncco: [
+          { action: 'connect', from: run.from, timeout: 60, endpoint: [{ type: 'phone', number: run.humanForward }] },
+        ] },
+      });
+      leg.outcome = r.status < 300 ? 'human_transferred' : 'transfer_failed';
+      if (r.status < 300) logSf(runId, legId, 'live', `A person answered; call transferred to ${run.humanForward}.`);
+      else addLog(runId, `leg ${legId + 1} transfer FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
+      return;
+    }
+    // default: humans are the point in transfer modes / skipped in drop mode
+    addLog(runId, 'HUMAN detected - live conversation' + (run.mode === 'drop' ? ' (skipping, no message left)' : ''), 'good');
+    leg.outcome = run.mode === 'drop' ? 'human_skipped' : 'human';
+    logSf(runId, legId, 'live', 'A live conversation happened - a person answered' + (run.mode === 'drop' ? ' (no voicemail left).' : '.'));
+    await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
       action: 'transfer',
       destination: { type: 'ncco', ncco: [
         { action: 'talk', text: 'Sorry to disturb you. Goodbye.', language: 'en-US' },
       ] },
     });
-    // drop mode advances on the 'completed' event, never from here
     return;
   }
 
   if (status === 'machine') {
-    addLog(sid, 'MACHINE detected' + (sub ? ` (${sub})` : ''), 'warn');
+    addLog(runId, `leg ${legId + 1} MACHINE detected` + (sub ? ` (${sub})` : ''), 'warn');
     const atBeep = sub === 'beep_start' || sub === 'beep_timeout';
 
-    if (c.mode === 'drop') {
-      if (!atBeep || c.transferred) return;   // wait for the beep, drop once
-      c.transferred = true; c.done = true; c.dropped++;
-      const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + c.uuid, {
+    if (run.mode === 'drop') {
+      if (!atBeep || leg.transferred) return;   // wait for the beep, drop once
+      leg.transferred = true; leg.done = true;
+      const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
         action: 'transfer',
-        destination: { type: 'ncco', ncco: dropNcco() },
+        destination: { type: 'ncco', ncco: dropNcco(run) },
       });
-      addLog(sid, r.status < 300 ? `${dropMessage ? 'recorded' : 'automatic'} message dropped after the beep`
-        : 'drop FAILED: ' + JSON.stringify(r.data).slice(0, 200), r.status < 300 ? 'good' : 'bad');
-      if (r.status < 300) logSf(sid, 'machine', 'Answering machine detected; ' + (dropMessage ? 'recorded' : 'automated') + ' voicemail message left.');
-      // 'completed' fires when the stream finishes -> nextInList from there
-      return;
+      if (r.status < 300) {
+        leg.outcome = 'machine_message_dropped';
+        addLog(runId, `leg ${legId + 1} - ${msgLabel(run)} dropped after the beep`, 'good');
+        logSf(runId, legId, 'machine', 'Answering machine detected; voicemail message left.');
+      } else {
+        leg.outcome = 'drop_failed';
+        addLog(runId, `leg ${legId + 1} drop FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
+      }
+      return; // 'completed' fires when the stream finishes
     }
 
     // transfer modes
-    const go = c.mode === 'detect' ? true : atBeep;
-    if (!go || c.transferred) return;
-    c.transferred = true; c.done = true;
-    const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + c.uuid, {
+    const go = run.mode === 'detect' ? true : atBeep;
+    if (!go || leg.transferred) return;
+    leg.transferred = true; leg.done = true;
+    const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
       action: 'transfer',
       destination: { type: 'ncco', ncco: [
-        { action: 'connect', from: c.from, timeout: 45, endpoint: [{ type: 'phone', number: c.forward }] },
+        { action: 'connect', from: run.from, timeout: 45, endpoint: [{ type: 'phone', number: run.forward }] },
       ] },
     });
-    addLog(sid, r.status < 300 ? `TRANSFERRED to ${c.forward}` : 'transfer FAILED: ' + JSON.stringify(r.data).slice(0, 200),
+    leg.outcome = r.status < 300 ? 'machine_transferred' : 'transfer_failed';
+    addLog(runId, r.status < 300 ? `TRANSFERRED to ${run.forward}` : 'transfer FAILED: ' + JSON.stringify(r.data).slice(0, 200),
       r.status < 300 ? 'good' : 'bad');
-    if (r.status < 300) logSf(sid, 'machine', `Answering machine detected; call transferred to ${c.forward}.`);
+    if (r.status < 300) logSf(runId, legId, 'machine', `Answering machine detected; call transferred to ${run.forward}.`);
   }
 });
 
