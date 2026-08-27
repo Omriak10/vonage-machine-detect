@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Machine Detect - Full guide</title>
+<style>
+  :root{ --ink:#0b0b0c; --body:#33343a; --mut:#8a8a90; --line:#e6e6e8; --bg:#ffffff; --soft:#f7f7f8; --accent:#0b0b0c; }
+  *{box-sizing:border-box} html,body{margin:0}
+  body{background:var(--bg);color:var(--body);font-family:-apple-system,'Segoe UI','Helvetica Neue',Arial,sans-serif;line-height:1.6;font-size:16px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 24px}
+  header{border-bottom:1px solid var(--line);position:sticky;top:0;background:#fff;z-index:5}
+  .hrow{display:flex;align-items:center;justify-content:space-between;height:60px}
+  .brand{display:inline-flex;align-items:center;gap:10px;font-weight:700;color:var(--ink)}
+  .vmark{width:26px;height:23px}
+  .hlinks a{color:var(--ink);text-decoration:none;font-size:14px;border:1px solid var(--line);padding:7px 13px;border-radius:8px;margin-left:8px}
+  .hero{padding:50px 0 26px;border-bottom:1px solid var(--line)}
+  .hero h1{font-size:34px;line-height:1.1;letter-spacing:-1px;margin:0 0 10px;color:var(--ink);font-weight:800}
+  .hero p{font-size:18px;margin:0;max-width:640px}
+  .part{font-size:12px;font-weight:800;letter-spacing:1.4px;text-transform:uppercase;color:var(--mut);margin:52px 0 6px}
+  .parthead{font-size:23px;font-weight:800;color:var(--ink);letter-spacing:-.4px;margin:0 0 6px}
+  .partsub{color:var(--mut);margin:0 0 12px}
+  .step{padding:30px 0;border-bottom:1px solid var(--line)}
+  .step .t{display:flex;gap:16px;align-items:flex-start}
+  .num{flex:0 0 36px;height:36px;background:var(--ink);color:#fff;border-radius:9px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px}
+  .step h3{margin:1px 0 6px;font-size:19px;color:var(--ink);font-weight:700;letter-spacing:-.2px}
+  .step p{margin:0 0 8px;font-size:16px}
+  .shot{margin:16px 0 0 52px;border:1px solid var(--line);border-radius:12px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.06)}
+  .shot img{display:block;width:100%}
+  .tip{margin:12px 0 0 52px;padding:12px 15px;border:1px solid var(--line);border-left:3px solid var(--ink);border-radius:8px;background:var(--soft);font-size:14.5px;color:var(--ink)}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:14px;color:var(--ink);font-family:'SF Mono',Consolas,monospace}
+  pre{background:#0f1113;color:#e9edf1;border-radius:11px;padding:16px 18px;font-size:13px;line-height:1.55;overflow-x:auto;margin:12px 0 0;font-family:'SF Mono',Consolas,monospace}
+  pre .c{color:#8b98a5}
+  table{width:100%;border-collapse:collapse;border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-top:14px}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);font-size:14px;vertical-align:top}
+  th{background:var(--ink);color:#fff;font-size:11.5px;text-transform:uppercase;letter-spacing:.5px}
+  td code{font-size:13px}
+  tr:last-child td{border-bottom:none}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 0 52px}
+  .chip{border:1px solid var(--line);border-radius:20px;padding:6px 13px;font-size:13px;font-weight:600;color:var(--ink)}
+  footer{padding:36px 0;color:var(--mut);font-size:13px;text-align:center;border-top:1px solid var(--line)}
+  @media(max-width:640px){ .shot,.tip,.chips{margin-left:0} .hero h1{font-size:27px} }
+</style>
+</head>
+<body>
+<header><div class="wrap hrow">
+  <span class="brand"><svg class="vmark" viewBox="0 0 34 30" fill="#131415"><path d="M13.031 14.745L6.656.6H0l9.547 21.486c.042.093.174.093.214 0l3.27-7.34zM26.933.6s-8.635 19.478-9.715 21.862c-2.582 5.697-4.495 7.123-6.444 7.428a.037.037 0 00-.032.037c0 .02.016.038.037.038h6.097c2.683 0 4.519-1.805 7.105-7.503C24.885 20.472 33.706.6 33.706.6h-6.773z"/></svg> Machine Detect</span>
+  <span class="hlinks"><a href="/">Open the console</a><a href="/code">API reference</a></span>
+</div></header>
+
+<div class="hero"><div class="wrap">
+  <h1>Machine Detect - the full guide</h1>
+  <p>Place calls, let Vonage decide human vs answering machine, and act on it - transfer the live person to an agent, or leave a voicemail. Two ways to use it: the console (point and click) or the API (integrate into your own system).</p>
+</div></div>
+
+<div class="wrap">
+
+  <div class="part">First, the idea</div>
+  <div class="parthead">What it does, in one line each</div>
+  <div class="step"><div class="t"><div class="num">1</div><div><h3>Transfer if machine</h3><p>Call one number. If a <b>machine</b> answers, transfer the call to a colleague / queue. If a <b>human</b> answers, it just says a short goodbye and hangs up. (Modes <code>detect</code> and <code>detect_beep</code>.)</p></div></div></div>
+  <div class="step"><div class="t"><div class="num">2</div><div><h3>Voicemail drop</h3><p>Call a whole <b>list</b> of numbers. On a machine, leave a voicemail after the beep and move on. On a human, do what you choose - skip, forward to a person, or transfer to your contact centre over SIP. (Mode <code>drop</code>.)</p></div></div></div>
+
+  <div class="part">Part 1</div>
+  <div class="parthead">One-time setup</div>
+  <p class="partsub">Two minutes. You just tell Vonage which number(s) can make the calls.</p>
+
+  <div class="step"><div class="t"><div class="num">1</div><div>
+    <h3>Link your number(s) to the Application</h3>
+    <p>In the Vonage Dashboard, open your account, go to <b>Applications</b>, open <b>Machine Detect</b>, and under <b>Linked numbers</b> link the number(s) you want to call from. You can link several - the tool can spread a run across all of them.</p>
+    <div class="tip"><b>You can use multiple numbers.</b> In the console's <b>Caller number(s)</b> box (or the API <code>from</code> field) enter several, comma-separated, and calls are spread across them.</div>
+  </div></div></div>
+  <div class="step"><div class="t"><div class="num">2</div><div>
+    <h3>(For SIP transfer) point your contact centre at a SIP address</h3>
+    <p>If you want live answers routed to your VCC / agents, have the SIP address ready, e.g. <code>sip:queue@yourvcc.sip.vonage.com</code>. You'll paste it in the console or send it as <code>sipUri</code>.</p>
+  </div></div></div>
+
+  <div class="part">Part 2</div>
+  <div class="parthead">Using the console (point and click)</div>
+  <p class="partsub">Open the tool at the base URL. Everything is one screen.</p>
+
+  <div class="step"><div class="t"><div class="num">1</div><div>
+    <h3>Pick what happens: the Detection Mode</h3>
+    <p>Top of the form. Choose <b>Transfer as soon as a machine is detected</b>, <b>Transfer after the beep</b>, or <b>Leave a voicemail on a list</b>. (Salesforce is optional - ignore that box unless you use it.)</p>
+    <div class="shot"><img src="/img/console_top.jpg" alt="Console top - detection mode"/></div>
+  </div></div></div>
+
+  <div class="step"><div class="t"><div class="num">2</div><div>
+    <h3>Enter the number(s), the caller ID, and press Call</h3>
+    <p><b>Transfer modes:</b> enter the <b>Number to call</b> and the <b>Forward to</b> number. <b>Voicemail drop:</b> paste your list of numbers (one per line, CSV allowed: <code>number,name,id</code>) and upload/record the message. Then set <b>Caller number(s)</b> and press <b>Call</b>.</p>
+    <div class="shot"><img src="/img/console_run.jpg" alt="Console - numbers, caller id, Call button, live listen and event log"/></div>
+  </div></div></div>
+
+  <div class="step"><div class="t"><div class="num">3</div><div>
+    <h3>Watch it happen</h3>
+    <p>The <b>Event log</b> shows each call live (calling, human/machine detected, transferred, voicemail left). <b>Live listen</b> lets you hear the far side of the call from your browser.</p>
+  </div></div></div>
+
+  <div class="part">Part 3</div>
+  <div class="parthead">Integrate via API (Postman / your system)</div>
+  <p class="partsub">Everything the console does is a plain HTTP call. Base URL below - no auth needed to the tool itself.</p>
+  <div class="chips"><span class="chip">Base URL: <span id="baseurl"></span></span></div>
+
+  <div class="step"><div class="t"><div class="num">1</div><div>
+    <h3>Start a call / run - <code>POST /api/call</code></h3>
+    <p>One endpoint does everything. Send JSON. Example - a voicemail-drop over a list, humans routed to your SIP agent, results posted to your endpoint:</p>
+    <pre>curl -X POST "$BASE/api/call" -H "Content-Type: application/json" -d '{
+  "mode": "drop",
+  "numbers": "447700900461,Jane Doe\n447700900462,John Roe",
+  "from": "447700900111,447700900112",     <span class="c">// one or many caller IDs</span>
+  "concurrency": 5,
+  "humanAction": "sip",
+  "sipUri": "sip:queue@yourvcc.sip.vonage.com",
+  "sipHeaders": { "X-CRM-Id": "{{whoId}}" }, <span class="c">// carried to your VCC screen-pop</span>
+  "ringTimeout": 45, "beepTimeout": 45, "agentTimeout": 30,
+  "resultWebhook": "https://your-system.example.com/hooks/md"
+}'</pre>
+    <p>Returns <code>{ "ok": true, "runId": "1a2b3c4d", ... }</code>.</p>
+  </div></div></div>
+
+  <div class="step"><div class="t"><div class="num">2</div><div>
+    <h3>The fields you can send</h3>
+    <table>
+      <tr><th>Field</th><th>What it does</th></tr>
+      <tr><td><code>mode</code></td><td><code>detect</code> / <code>detect_beep</code> (transfer if machine) or <code>drop</code> (voicemail campaign).</td></tr>
+      <tr><td><code>to</code>, <code>forward</code></td><td>Transfer modes: the number to call + where to send it on a machine.</td></tr>
+      <tr><td><code>numbers</code> / <code>members</code></td><td>Drop mode: the list. Text (<code>number,name,id</code> per line) or <code>[{number,name,whoId}]</code>.</td></tr>
+      <tr><td><code>from</code></td><td>Caller ID - one number, or several comma-separated to spread across a pool.</td></tr>
+      <tr><td><code>concurrency</code></td><td>Drop mode: how many calls at once (1-10).</td></tr>
+      <tr><td><code>humanAction</code></td><td>Drop mode, when a human answers: <code>skip</code> / <code>forward</code> / <code>sip</code>.</td></tr>
+      <tr><td><code>humanForward</code> / <code>sipUri</code></td><td>Where live answers go (a phone number, or a SIP address).</td></tr>
+      <tr><td><code>sipHeaders</code></td><td>Custom SIP headers for your VCC (values support <code>{{whoId}} {{number}} {{name}}</code>).</td></tr>
+      <tr><td><code>messageId</code></td><td>Drop mode: which uploaded voicemail to play (see <code>/api/messages</code>).</td></tr>
+      <tr><td><code>ringTimeout</code></td><td>Ring the person this long with no answer, then hang up. Default 45.</td></tr>
+      <tr><td><code>beepTimeout</code></td><td>Wait this long for the voicemail beep. Default 45.</td></tr>
+      <tr><td><code>agentTimeout</code></td><td>Ring the agent this long on a transfer, then give up. Default 45.</td></tr>
+      <tr><td><code>resultWebhook</code></td><td>Your HTTPS endpoint - one JSON result per callout is POSTed here.</td></tr>
+    </table>
+  </div></div></div>
+
+  <div class="step"><div class="t"><div class="num">3</div><div>
+    <h3>Other endpoints</h3>
+    <table>
+      <tr><th>Call</th><th>Purpose</th></tr>
+      <tr><td><code>GET /api/run/:id</code></td><td>Poll a run's status + per-call outcomes.</td></tr>
+      <tr><td><code>POST /api/message?name=</code></td><td>Upload a voicemail (raw WAV, 16-bit PCM 16 kHz mono). Returns its id.</td></tr>
+      <tr><td><code>GET /api/messages</code></td><td>List uploaded voicemails.</td></tr>
+      <tr><td><code>POST /api/list</code> / <code>GET /api/lists</code></td><td>Save + list reusable call lists.</td></tr>
+    </table>
+    <div class="tip">Full request/response reference is on the <a href="/code" style="color:var(--ink)"><b>API reference</b></a> page (also linked top-right).</div>
+  </div></div></div>
+
+  <div class="part">Part 4</div>
+  <div class="parthead">The JSON your system receives</div>
+  <p class="partsub">Set <code>resultWebhook</code> to your endpoint. We POST <b>one <code>call_result</code> per callout</b>, then one <code>run_completed</code> at the end of a batch. Nothing is written anywhere else.</p>
+
+  <div class="step"><div class="t"><div class="num">1</div><div>
+    <h3>One result per call</h3>
+    <pre>{
+  "event": "call_result",
+  "runId": "1a2b3c4d", "legId": 12,
+  "callUuid": "63f61863-4a51-4f6a-bba5-3f6e9a9c1e77",
+  "mode": "drop",
+  "number": "447700900461", "name": "Jane Doe", "whoId": "00Q5g000004AbCdEAA",
+  "from": "447700900111",
+  "answeredBy": "human",              <span class="c">// human | machine | none</span>
+  "action": "transferred_to_agent",   <span class="c">// voicemail_left | transferred_to_agent | skipped | no_answer | failed</span>
+  "transferredTo": { "type": "sip", "destination": "sip:queue@yourvcc.sip.vonage.com" },
+  "voicemailMessageId": null,
+  "outcome": "human_transferred",
+  "timeouts": { "ringSec": 45, "beepSec": 45, "agentSec": 30 },
+  "at": "2026-08-26T10:15:20.100Z"
+}</pre>
+    <p>The two fields you'll branch on: <code>answeredBy</code> (human / machine / none) and <code>action</code> (what we did).</p>
+  </div></div></div>
+
+  <div class="step"><div class="t"><div class="num">2</div><div>
+    <h3>One summary per batch</h3>
+    <pre>{
+  "event": "run_completed", "runId": "1a2b3c4d", "mode": "drop",
+  "total": 250,
+  "counts": { "machine_message_dropped": 180, "human_transferred": 42,
+              "no_answer": 25, "failed": 3 },
+  "at": "2026-08-26T10:32:00.000Z"
+}</pre>
+    <div class="tip">Your endpoint should reply <code>2xx</code> quickly - we don't retry, and we time out our POST after 5 seconds so a slow endpoint never holds up dialling.</div>
+  </div></div></div>
+
+  <div class="part">Part 5</div>
+  <div class="parthead">Timeouts &amp; silence handling</div>
+  <div class="step"><div class="t"><div class="num">1</div><div>
+    <h3>You control every timeout</h3>
+    <p><code>ringTimeout</code> = ring the person X seconds then hang up (your "if it's rung for X, drop it"). <code>beepTimeout</code> = wait for the voicemail beep. <code>agentTimeout</code> = ring the agent on a transfer then give up. All optional, all in seconds.</p>
+    <div class="tip"><b>Silence after answer:</b> if a person picks up and says nothing - when an agent is free the call connects and the agent hears it; when the agent is busy we leave the voicemail and hang up; and an unanswered call is dropped after your <code>ringTimeout</code>.</div>
+  </div></div></div>
+
+</div>
+
+<footer><div class="wrap">Vonage Machine Detect - results are POSTed to your endpoint only. Powered by the Vonage Voice API.</div></footer>
+<script>var b=document.getElementById("baseurl");if(b)b.textContent=location.origin;</script></body>
+</html>
