@@ -172,12 +172,13 @@ async function placeLeg(runId, legId) {
   const amd = {
     behavior: 'continue',
     mode: run.mode === 'detect' ? 'detect' : 'detect_beep', // drops wait for the beep
-    beep_timeout: 45, // mandatory for AMD (30-120s) whatever the mode
+    beep_timeout: run.beepTimeout || 45, // mandatory for AMD (30-120s) whatever the mode
   };
   const { status, data } = await api('POST', 'https://api.nexmo.com/v1/calls', {
     to: [{ type: 'phone', number: m.number }],
     from: { type: 'phone', number: fromNum },
     advanced_machine_detection: amd,
+    ringing_timer: run.ringTimeout || 45, // ring this long with no answer, then hang up (unanswered)
     event_url: [HOST + '/webhooks/events?sid=' + runId + '&leg=' + legId],
     ncco: [
       // websocket leg keeps the call alive while AMD runs AND feeds live listen
@@ -245,19 +246,51 @@ function maybeFinishRun(runId) {
   setTimeout(() => { if (runs[runId] && runs[runId].finished) { store.remove(runId); } }, 6 * 60 * 60 * 1000);
 }
 
-// fire-and-forget outcome push to the client's webhook
+// Map an internal outcome to the plain "what happened" fields the client consumes.
+function outcomeMeta(outcome) {
+  const o = String(outcome || '');
+  if (o === 'machine_message_dropped') return { answeredBy: 'machine', action: 'voicemail_left' };
+  if (o === 'machine_transferred')     return { answeredBy: 'machine', action: 'transferred' };
+  if (o === 'human_transferred')       return { answeredBy: 'human',   action: 'transferred_to_agent' };
+  if (o === 'human_skipped')           return { answeredBy: 'human',   action: 'skipped' };
+  if (o === 'human')                   return { answeredBy: 'human',   action: 'live_conversation' };
+  if (o === 'no_answer')               return { answeredBy: 'none',    action: 'no_answer' };
+  if (o === 'failed' || o.startsWith('failed')) return { answeredBy: 'none', action: 'failed' };
+  if (o.endsWith('_failed'))           return { answeredBy: null,      action: 'action_failed' };
+  return { answeredBy: null, action: o || 'completed' };
+}
+
+// fire-and-forget: POST ONE clean JSON per callout to the client's endpoint
+// (nothing is written to Salesforce unless logToSf is separately enabled).
 function pushResult(run, legId, outcome, detail) {
   if (!run.resultWebhook) return;
   const leg = legId != null ? run.legs[legId] : null;
-  const body = leg ? {
-    event: 'call_result', runId: run.id, legId, mode: run.mode,
-    number: leg.m.number, name: leg.m.name || null, whoId: leg.m.whoId || null,
-    outcome, detail: detail || null, callUuid: leg.uuid, messageId: run.messageId || null,
-    at: new Date().toISOString(),
-  } : {
-    event: 'run_completed', runId: run.id, mode: run.mode, total: run.list.length,
-    counts: run.counts, at: new Date().toISOString(),
-  };
+  let body;
+  if (leg) {
+    const meta = outcomeMeta(outcome);
+    const agent = run.humanAction === 'sip' ? { type: 'sip', destination: run.sipUri || null }
+      : run.humanAction === 'forward' ? { type: 'phone', destination: run.humanForward || null }
+      : (run.mode !== 'drop' && run.forward) ? { type: 'phone', destination: run.forward } : null;
+    body = {
+      event: 'call_result',
+      runId: run.id, legId, callUuid: leg.uuid, mode: run.mode,
+      number: leg.m.number, name: leg.m.name || null, whoId: leg.m.whoId || null,
+      from: leg.from || run.from,
+      answeredBy: meta.answeredBy,              // human | machine | none
+      action: meta.action,                      // voicemail_left | transferred_to_agent | skipped | live_conversation | no_answer | failed
+      transferredTo: (String(meta.action).startsWith('transferred') && agent) ? agent : null,
+      voicemailMessageId: outcome === 'machine_message_dropped' ? (run.messageId || 'default') : null,
+      outcome,                                  // full internal status, for reference
+      detail: detail || null,
+      timeouts: { ringSec: run.ringTimeout, beepSec: run.beepTimeout, agentSec: run.agentTimeout },
+      at: new Date().toISOString(),
+    };
+  } else {
+    body = {
+      event: 'run_completed', runId: run.id, mode: run.mode,
+      total: run.list.length, counts: run.counts, at: new Date().toISOString(),
+    };
+  }
   fetch(run.resultWebhook, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
@@ -291,12 +324,19 @@ app.post('/api/call', async (req, res) => {
   const runId = crypto.randomUUID().slice(0, 8);
   const resultWebhook = /^https?:\/\//.test(String(b.resultWebhook || '')) ? String(b.resultWebhook) : null;
 
+  // ---- configurable timeouts (seconds). All optional, with safe defaults ----
+  const num = (v, def, lo, hi) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def; };
+  const ringTimeout = num(b.ringTimeout, 45, 5, 120);   // ring the called party this long, then hang up (no answer)
+  const beepTimeout = num(b.beepTimeout, 45, 30, 120);  // AMD: wait this long for the voicemail beep
+  const agentTimeout = num(b.agentTimeout, 45, 5, 120); // ring the agent/forward this long on transfer, then give up
+
   const toMember = (x) => (typeof x === 'string'
     ? { number: clean(x) }
     : { number: clean(x.number), whoId: x.whoId, name: x.name });
 
   const run = {
     id: runId, mode, from, fromPool, logToSf, resultWebhook,
+    ringTimeout, beepTimeout, agentTimeout,
     legs: {}, nextIdx: 0, active: 0, counts: {}, finished: false,
     createdAt: Date.now(),
   };
@@ -502,7 +542,7 @@ app.post('/webhooks/events', async (req, res) => {
       const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
         action: 'transfer',
         destination: { type: 'ncco', ncco: [
-          { action: 'connect', from: leg.from || run.from, timeout: 60,
+          { action: 'connect', from: leg.from || run.from, timeout: run.agentTimeout || 45,
             endpoint: [{ type: 'sip', uri: run.sipUri, headers }] },
         ] },
       });
@@ -521,7 +561,7 @@ app.post('/webhooks/events', async (req, res) => {
       const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
         action: 'transfer',
         destination: { type: 'ncco', ncco: [
-          { action: 'connect', from: leg.from || run.from, timeout: 60, endpoint: [{ type: 'phone', number: run.humanForward }] },
+          { action: 'connect', from: leg.from || run.from, timeout: run.agentTimeout || 45, endpoint: [{ type: 'phone', number: run.humanForward }] },
         ] },
       });
       leg.outcome = r.status < 300 ? 'human_transferred' : 'transfer_failed';
@@ -571,7 +611,7 @@ app.post('/webhooks/events', async (req, res) => {
     const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
       action: 'transfer',
       destination: { type: 'ncco', ncco: [
-        { action: 'connect', from: leg.from || run.from, timeout: 45, endpoint: [{ type: 'phone', number: run.forward }] },
+        { action: 'connect', from: leg.from || run.from, timeout: run.agentTimeout || 45, endpoint: [{ type: 'phone', number: run.forward }] },
       ] },
     });
     leg.outcome = r.status < 300 ? 'machine_transferred' : 'transfer_failed';
@@ -628,6 +668,7 @@ app.get('/code/raw/:file', (req, res) => {
   res.set('Content-Type', 'text/plain; charset=utf-8').send(fs.readFileSync(path.join(__dirname, f), 'utf8'));
 });
 app.get('/code', (req, res) => res.sendFile(path.join(__dirname, 'public', 'code.html')));
+app.get('/guide', (req, res) => res.sendFile(path.join(__dirname, 'public', 'guide.html')));
 
 // ------------------------------------------------------ live listen bridge
 // Vonage streams the call audio here; every browser listener gets a copy.
