@@ -171,7 +171,7 @@ async function placeLeg(runId, legId) {
   run.legs[legId] = leg; // active slot was reserved by launchNext
   const amd = {
     behavior: 'continue',
-    mode: run.mode === 'detect' ? 'detect' : 'detect_beep', // drops wait for the beep
+    mode: run.mode === 'drop' ? 'detect_beep' : 'detect', // only message-drops wait for the beep; transfer/detect act on first machine signal
     beep_timeout: run.beepTimeout || 45, // mandatory for AMD (30-120s) whatever the mode
   };
   const { status, data } = await api('POST', 'https://api.nexmo.com/v1/calls', {
@@ -251,6 +251,7 @@ function outcomeMeta(outcome) {
   const o = String(outcome || '');
   if (o === 'machine_message_dropped') return { answeredBy: 'machine', action: 'voicemail_left' };
   if (o === 'machine_transferred')     return { answeredBy: 'machine', action: 'transferred' };
+  if (o === 'machine')                 return { answeredBy: 'machine', action: 'no_message' };
   if (o === 'human_transferred')       return { answeredBy: 'human',   action: 'transferred_to_agent' };
   if (o === 'human_skipped')           return { answeredBy: 'human',   action: 'skipped' };
   if (o === 'human')                   return { answeredBy: 'human',   action: 'live_conversation' };
@@ -604,20 +605,36 @@ app.post('/webhooks/events', async (req, res) => {
       return; // 'completed' fires when the stream finishes
     }
 
-    // transfer modes
-    const go = run.mode === 'detect' ? true : atBeep;
-    if (!go || leg.transferred) return;
+    // transfer modes: act on the FIRST machine signal - do NOT wait for a beep.
+    // Carrier voicemails often never present a clean beep, so waiting left the
+    // call sitting silently bridged to the live-listen socket, which the
+    // voicemail then recorded as a BLANK message and we logged as "no answer".
+    if (leg.transferred) return;
     leg.transferred = true; leg.done = true;
+    if (!run.forward) {
+      // no agent to transfer to and no message to leave -> hang up immediately
+      // so we never record a blank voicemail; report it honestly as a machine.
+      await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'hangup' }).catch(() => {});
+      leg.outcome = 'machine';
+      addLog(runId, `leg ${legId + 1} - answering machine, no forward set; hung up (no blank voicemail left)`, 'warn');
+      logSf(runId, legId, 'machine', 'Answering machine / voicemail reached - no message left.');
+      return;
+    }
     const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
       action: 'transfer',
       destination: { type: 'ncco', ncco: [
         { action: 'connect', from: leg.from || run.from, timeout: run.agentTimeout || 45, endpoint: [{ type: 'phone', number: run.forward }] },
       ] },
     });
-    leg.outcome = r.status < 300 ? 'machine_transferred' : 'transfer_failed';
-    addLog(runId, r.status < 300 ? `TRANSFERRED to ${run.forward}` : 'transfer FAILED: ' + JSON.stringify(r.data).slice(0, 200),
-      r.status < 300 ? 'good' : 'bad');
-    if (r.status < 300) logSf(runId, legId, 'machine', `Answering machine detected; call transferred to ${run.forward}.`);
+    if (r.status < 300) {
+      leg.outcome = 'machine_transferred';
+      addLog(runId, `TRANSFERRED to ${run.forward}`, 'good');
+      logSf(runId, legId, 'machine', `Answering machine detected; call transferred to ${run.forward}.`);
+    } else {
+      leg.outcome = 'transfer_failed';
+      await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'hangup' }).catch(() => {}); // don't leave a blank voicemail
+      addLog(runId, 'transfer FAILED: ' + JSON.stringify(r.data).slice(0, 200), 'bad');
+    }
   }
 });
 
