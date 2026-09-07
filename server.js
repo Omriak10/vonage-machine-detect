@@ -330,6 +330,7 @@ app.post('/api/call', async (req, res) => {
   const ringTimeout = num(b.ringTimeout, 45, 5, 120);   // ring the called party this long, then hang up (no answer)
   const beepTimeout = num(b.beepTimeout, 45, 30, 120);  // AMD: wait this long for the voicemail beep
   const agentTimeout = num(b.agentTimeout, 45, 5, 120); // ring the agent/forward this long on transfer, then give up
+  const dropDelay = num(b.dropDelay, 12, 2, 30);        // drop mode: if no beep event, leave the message this long after machine detection
 
   const toMember = (x) => (typeof x === 'string'
     ? { number: clean(x) }
@@ -337,7 +338,7 @@ app.post('/api/call', async (req, res) => {
 
   const run = {
     id: runId, mode, from, fromPool, logToSf, resultWebhook,
-    ringTimeout, beepTimeout, agentTimeout,
+    ringTimeout, beepTimeout, agentTimeout, dropDelay,
     legs: {}, nextIdx: 0, active: 0, counts: {}, finished: false,
     createdAt: Date.now(),
   };
@@ -526,6 +527,7 @@ app.post('/webhooks/events', async (req, res) => {
   // sends 'completed', and treating only 'completed' as terminal stalls a slot.
   const TERMINAL = ['completed', 'failed', 'rejected', 'busy', 'unanswered', 'timeout', 'cancelled'];
   if (TERMINAL.includes(status)) {
+    if (leg.dropTimer) { clearTimeout(leg.dropTimer); leg.dropTimer = null; }
     if (!leg.done && status === 'completed') addLog(runId, `leg ${legId + 1} - ended before detection`);
     finishLeg(runId, legId, leg.outcome || (status === 'completed' ? (leg.done ? 'completed' : 'no_answer') : status));
     return;
@@ -588,19 +590,36 @@ app.post('/webhooks/events', async (req, res) => {
     const atBeep = sub === 'beep_start' || sub === 'beep_timeout';
 
     if (run.mode === 'drop') {
-      if (!atBeep || leg.transferred) return;   // wait for the beep, drop once
-      leg.transferred = true; leg.done = true;
-      const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
-        action: 'transfer',
-        destination: { type: 'ncco', ncco: dropNcco(run) },
-      });
-      if (r.status < 300) {
-        leg.outcome = 'machine_message_dropped';
-        addLog(runId, `leg ${legId + 1} - ${msgLabel(run)} dropped after the beep`, 'good');
-        logSf(runId, legId, 'machine', 'Answering machine detected; voicemail message left.');
-      } else {
-        leg.outcome = 'drop_failed';
-        addLog(runId, `leg ${legId + 1} drop FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
+      if (leg.transferred) return;
+      // Leave the voicemail message. The ideal moment is right after the beep,
+      // but many carrier voicemails never send a clean beep event - they fire a
+      // bare 'machine' signal and nothing else. Waiting for a beep that never
+      // comes is exactly why messages were coming out blank / logged "no answer".
+      // So: drop the moment we hear the beep, and if no beep arrives shortly
+      // after the machine is detected, drop anyway.
+      const doDrop = async () => {
+        if (leg.transferred) return;
+        leg.transferred = true; leg.done = true;
+        if (leg.dropTimer) { clearTimeout(leg.dropTimer); leg.dropTimer = null; }
+        const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
+          action: 'transfer',
+          destination: { type: 'ncco', ncco: dropNcco(run) },
+        });
+        if (r.status < 300) {
+          leg.outcome = 'machine_message_dropped';
+          addLog(runId, `leg ${legId + 1} - ${msgLabel(run)} left on the voicemail`, 'good');
+          logSf(runId, legId, 'machine', 'Answering machine detected; voicemail message left.');
+        } else {
+          leg.outcome = 'drop_failed';
+          addLog(runId, `leg ${legId + 1} drop FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
+        }
+      };
+      if (atBeep) { await doDrop(); return; }   // heard the beep (or Vonage timed out waiting for one) -> drop now
+      // first bare 'machine' signal: give the beep a brief window, then drop regardless
+      if (!leg.dropTimer) {
+        const waitMs = (run.dropDelay || 12) * 1000; // ~ when a real voicemail recording begins
+        addLog(runId, `leg ${legId + 1} - machine detected; will leave the message on the beep, or in ${waitMs / 1000}s if no beep`);
+        leg.dropTimer = setTimeout(() => { doDrop().catch(() => {}); }, waitMs);
       }
       return; // 'completed' fires when the stream finishes
     }
