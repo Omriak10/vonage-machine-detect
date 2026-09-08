@@ -101,8 +101,17 @@ const clean = (n) => String(n || '').replace(/[^\d]/g, '');
 // Persisted to the instance's tmp dir so a process restart keeps them.
 const MSG_DIR = os.tmpdir();
 const MSG_INDEX = path.join(MSG_DIR, 'md-messages.json');
-const MSG_PATH = path.join(MSG_DIR, 'drop-message.wav'); // legacy default
-let dropMessage = fs.existsSync(MSG_PATH) ? fs.readFileSync(MSG_PATH) : null;
+const MSG_PATH = path.join(MSG_DIR, 'drop-message.wav'); // runtime-uploaded default (ephemeral: tmp, lost on redeploy)
+// A default announcement BUNDLED with the app: it ships inside the deploy
+// artifact, so it is ALWAYS present after a restart or redeploy (unlike the
+// tmp copy above). Drop a WAV at assets/default-message.wav (or point
+// DEFAULT_MSG_PATH at one) and it becomes the default voicemail message. The
+// English TTS further down is then only a genuine last resort if even this is
+// absent - so a redeploy can never silently revert to the English announcement.
+const BUNDLED_MSG = process.env.DEFAULT_MSG_PATH || path.join(__dirname, 'assets', 'default-message.wav');
+let dropMessage = fs.existsSync(MSG_PATH) ? fs.readFileSync(MSG_PATH)
+  : (fs.existsSync(BUNDLED_MSG) ? fs.readFileSync(BUNDLED_MSG) : null);
+if (dropMessage && !fs.existsSync(MSG_PATH)) console.log('[msg] loaded bundled default announcement from', BUNDLED_MSG, `(${dropMessage.length} bytes)`);
 let messages = {};  // id -> { name, bytes, file }
 try {
   if (fs.existsSync(MSG_INDEX)) {
@@ -114,8 +123,13 @@ try {
 } catch {}
 const saveMsgIndex = () => { try { fs.writeFileSync(MSG_INDEX, JSON.stringify(messages)); } catch {} };
 
-const AUTO_MESSAGE = "Hello, this is an automated message from Vonage. We tried to reach you but could not connect. "
-  + "Please call us back at your earliest convenience. Thank you, and have a great day.";
+// Last-resort spoken message, used ONLY if no recorded default is bundled or
+// uploaded. Both the text and its language are env-configurable so this can
+// never be an unexpected English announcement.
+const AUTO_MESSAGE = process.env.AUTO_MESSAGE
+  || ("Hello, this is an automated message from Vonage. We tried to reach you but could not connect. "
+  + "Please call us back at your earliest convenience. Thank you, and have a great day.");
+const AUTO_LANG = process.env.AUTO_MESSAGE_LANG || 'en-US';
 
 // ---------------------------------------------- saved call-list registry
 // Reusable named lists (one per campaign / call category), persisted so they
@@ -144,7 +158,7 @@ function dropNcco(run) {
     return [{ action: 'stream', streamUrl: [HOST + '/message/' + run.messageId + '.wav'] }];
   }
   if (dropMessage) return [{ action: 'stream', streamUrl: [HOST + '/message.wav'] }];
-  return [{ action: 'talk', text: AUTO_MESSAGE, language: 'en-US', style: 2 }];
+  return [{ action: 'talk', text: AUTO_MESSAGE, language: AUTO_LANG, style: 2 }];
 }
 const msgLabel = (run) => run.messageId && messages[run.messageId]
   ? `message "${messages[run.messageId].name}"` : (dropMessage ? 'default recorded message' : 'automatic message');
