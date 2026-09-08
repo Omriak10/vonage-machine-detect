@@ -131,6 +131,36 @@ const AUTO_MESSAGE = process.env.AUTO_MESSAGE
   + "Please call us back at your earliest convenience. Thank you, and have a great day.");
 const AUTO_LANG = process.env.AUTO_MESSAGE_LANG || 'en-US';
 
+// ---- durable default announcement (survives restart AND redeploy) -----------
+// The runtime upload above lands in tmp (wiped on redeploy). To let the CUSTOMER
+// set the default themselves via the console and have it STICK, we mirror it to
+// VCR instance state (Redis-backed, persists across redeploys). Loaded on boot.
+const DEFAULT_KEY = 'md-default-message-b64';
+let _state; // undefined = not tried, null = unavailable
+function vcrState() {
+  if (_state !== undefined) return _state;
+  try { const { vcr } = require('@vonage/vcr-sdk'); _state = vcr.getInstanceState(); }
+  catch (e) { console.log('[state] durable store unavailable (' + e.message + ') - default is tmp/bundled only'); _state = null; }
+  return _state;
+}
+async function saveDurableDefault(buf) {
+  const s = vcrState(); if (!s) return false;
+  try { await s.set(DEFAULT_KEY, buf.toString('base64')); console.log('[state] durable default announcement saved (' + buf.length + ' bytes)'); return true; }
+  catch (e) { console.error('[state] save default failed:', e.message); return false; }
+}
+async function deleteDurableDefault() {
+  const s = vcrState(); if (!s) return;
+  try { await s.delete(DEFAULT_KEY); } catch (e) { console.error('[state] delete default failed:', e.message); }
+}
+async function loadDurableDefault() {
+  const s = vcrState(); if (!s) return;
+  try {
+    const b64 = await s.get(DEFAULT_KEY);
+    if (b64) { dropMessage = Buffer.from(b64, 'base64'); console.log('[state] loaded durable default announcement (' + dropMessage.length + ' bytes)'); }
+  } catch (e) { console.error('[state] load default failed:', e.message); }
+}
+loadDurableDefault(); // fire-and-forget on boot; overrides tmp/bundled once ready
+
 // ---------------------------------------------- saved call-list registry
 // Reusable named lists (one per campaign / call category), persisted so they
 // survive a restart. A list is [{number, whoId?, name?}]. Sources: paste, CSV
@@ -511,7 +541,13 @@ app.post('/api/message', express.raw({ type: '*/*', limit: '15mb' }), (req, res)
   dropMessage = req.body;
   try { fs.writeFileSync(MSG_PATH, dropMessage); } catch {}
   addLog('msg', `default message saved (${Math.round(dropMessage.length / 1024)} KB)`, 'good');
-  res.json({ ok: true, id: 'default', bytes: dropMessage.length });
+  // persist durably so it survives a restart / redeploy (customer self-serve).
+  // Free-plan KV quota is 1 MB; base64 of a short (<~20s) WAV fits comfortably.
+  saveDurableDefault(dropMessage).then((ok) => {
+    if (ok) addLog('msg', 'default announcement stored durably - it will survive restarts and redeploys', 'good');
+    else addLog('msg', 'note: durable store unavailable, default kept in tmp only (lost on redeploy)', 'warn');
+  });
+  res.json({ ok: true, id: 'default', bytes: dropMessage.length, durable: !!vcrState() });
 });
 // ------------------------------------------------- saved call lists
 // Save a reusable list. Body: { name, numbers } (paste/CSV text) or
@@ -561,9 +597,11 @@ app.delete('/api/message/:id', (req, res) => {
   res.json({ ok: true });
 });
 app.delete('/api/message', (req, res) => {
-  dropMessage = null;
   try { fs.existsSync(MSG_PATH) && fs.unlinkSync(MSG_PATH); } catch {}
-  addLog('msg', 'reverted to automatic message', 'info');
+  deleteDurableDefault();
+  // fall back to the bundled announcement if one ships with the app, else TTS
+  dropMessage = fs.existsSync(BUNDLED_MSG) ? fs.readFileSync(BUNDLED_MSG) : null;
+  addLog('msg', dropMessage ? 'reverted to the bundled default announcement' : 'reverted to automatic message', 'info');
   res.json({ ok: true });
 });
 app.get('/message.wav', (req, res) => {
