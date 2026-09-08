@@ -149,6 +149,34 @@ function dropNcco(run) {
 const msgLabel = (run) => run.messageId && messages[run.messageId]
   ? `message "${messages[run.messageId].name}"` : (dropMessage ? 'default recorded message' : 'automatic message');
 
+// how long the dropped message plays, so we can hang up the moment it ends
+// instead of waiting for the voicemail's max-length timeout.
+function wavSeconds(buf) {
+  try {
+    if (buf && buf.length > 44 && buf.toString('ascii', 0, 4) === 'RIFF') {
+      let byteRate = 0, dataLen = 0, o = 12;
+      while (o + 8 <= buf.length) {
+        const id = buf.toString('ascii', o, o + 4);
+        const sz = buf.readUInt32LE(o + 4);
+        if (id === 'fmt ') byteRate = buf.readUInt32LE(o + 8 + 8);
+        else if (id === 'data') { dataLen = sz; break; }
+        o += 8 + sz + (sz & 1);
+      }
+      if (byteRate > 0 && dataLen > 0) return dataLen / byteRate;
+    }
+  } catch (e) {}
+  if (buf && buf.length) return buf.length / 32000; // assume 16-bit/16kHz mono
+  return 0;
+}
+function messageDurationMs(run) {
+  let sec = 0;
+  if (run.messageId && messages[run.messageId]) { try { sec = wavSeconds(fs.readFileSync(messages[run.messageId].file)); } catch (e) {} }
+  else if (dropMessage) sec = wavSeconds(dropMessage);
+  else sec = String(AUTO_MESSAGE).split(/\s+/).length / 2.6 + 1.5; // TTS estimate
+  if (!sec || sec < 1) sec = 8; // safety floor
+  return Math.round(sec * 1000);
+}
+
 // ---------------------------------------------------------------- calling
 // A run dials members as legs. Transfer modes are a run with a single member.
 function tmpl(v, run, legId, m) {
@@ -195,6 +223,15 @@ async function placeLeg(runId, legId) {
     return false;
   }
   leg.uuid = data.uuid;
+  leg.startedAt = Date.now();
+  // safety net: if Vonage never sends a terminal event (missed webhook, etc.)
+  // finalize the leg anyway so a call result is ALWAYS sent.
+  const wdMs = ((run.ringTimeout || 45) + (run.beepTimeout || 45) + 120) * 1000;
+  leg.watchdog = setTimeout(() => {
+    if (leg.finished) return;
+    addLog(runId, `leg ${legId + 1} - no terminal event within ${Math.round(wdMs / 1000)}s; finalizing so a result is sent`, 'warn');
+    finishLeg(runId, legId, leg.outcome || 'no_answer', 'watchdog: no terminal event received');
+  }, wdMs);
   persist(run);                       // durable: this number's call uuid is now known
   const who = m.name ? ` (${m.name})` : '';
   addLog(runId, run.mode === 'drop'
@@ -208,6 +245,7 @@ function finishLeg(runId, legId, outcome, detail) {
   const run = runs[runId];
   const leg = run.legs[legId];
   if (!leg || leg.finished) return;
+  for (const t of ['dropTimer', 'hangTimer', 'watchdog']) { if (leg[t]) { clearTimeout(leg[t]); leg[t] = null; } }
   leg.finished = true; leg.done = true; leg.outcome = outcome;
   run.active = Math.max(0, run.active - 1);
   run.counts[outcome] = (run.counts[outcome] || 0) + 1;
@@ -261,6 +299,37 @@ function outcomeMeta(outcome) {
   return { answeredBy: null, action: o || 'completed' };
 }
 
+// POST a webhook body with a few retries so a transient blip doesn't silently
+// lose a call result (reported bug: the result was "not always sent").
+async function postWebhook(url, body, runId, label) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(6000) });
+      if (r.ok) return true;
+      addLog(runId, `${label} webhook HTTP ${r.status} (attempt ${attempt}/3)`, attempt === 3 ? 'bad' : 'warn');
+    } catch (e) {
+      addLog(runId, `${label} webhook error: ${e.message} (attempt ${attempt}/3)`, attempt === 3 ? 'bad' : 'warn');
+    }
+    await new Promise((res) => setTimeout(res, 400 * attempt));
+  }
+  return false;
+}
+
+// immediate "answering machine detected" hook - fired the moment AMD says
+// machine, BEFORE and separate from the final result, so the CRM knows ASAP.
+function pushDetection(run, legId) {
+  if (!run.resultWebhook) return;
+  const leg = run.legs[legId]; if (!leg) return;
+  postWebhook(run.resultWebhook, {
+    event: 'machine_detected',
+    runId: run.id, legId, callUuid: leg.uuid, mode: run.mode,
+    number: leg.m.number, name: leg.m.name || null, whoId: leg.m.whoId || null,
+    from: leg.from || run.from, answeredBy: 'machine', action: 'detected',
+    at: new Date().toISOString(),
+  }, run.id, 'detection');
+}
+
 // fire-and-forget: POST ONE clean JSON per callout to the client's endpoint
 // (nothing is written to Salesforce unless logToSf is separately enabled).
 function pushResult(run, legId, outcome, detail) {
@@ -292,10 +361,7 @@ function pushResult(run, legId, outcome, detail) {
       total: run.list.length, counts: run.counts, at: new Date().toISOString(),
     };
   }
-  fetch(run.resultWebhook, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
-  }).catch((e) => addLog(run.id, 'result webhook failed: ' + e.message, 'bad'));
+  postWebhook(run.resultWebhook, body, run.id, legId != null ? 'result' : 'run');
 }
 
 // fire-and-forget Salesforce activity log for a leg's member
@@ -304,7 +370,7 @@ function logSf(runId, legId, kind, detail) {
   const m = run && run.legs[legId] && run.legs[legId].m;
   if (!run || !run.logToSf || !m || !m.whoId) return;
   sfdc.logActivity(m.whoId, kind, detail)
-    .then((r) => { if (r && r.id) addLog(runId, `logged to Salesforce (${kind === 'machine' ? 'machine detected' : 'live conversation'}) on ${m.name || m.whoId}`, 'info'); })
+    .then((r) => { if (r && r.id) addLog(runId, `logged to Salesforce (${String(kind).replace(/_/g, ' ')}) on ${m.name || m.whoId}`, 'info'); })
     .catch((e) => addLog(runId, 'Salesforce log failed: ' + e.message, 'bad'));
 }
 
@@ -331,6 +397,7 @@ app.post('/api/call', async (req, res) => {
   const beepTimeout = num(b.beepTimeout, 45, 30, 120);  // AMD: wait this long for the voicemail beep
   const agentTimeout = num(b.agentTimeout, 45, 5, 120); // ring the agent/forward this long on transfer, then give up
   const dropDelay = num(b.dropDelay, 12, 2, 30);        // drop mode: if no beep event, leave the message this long after machine detection
+  const minGreeting = num(b.minGreeting, 3, 0, 20);     // drop mode: ignore any "beep" within this many secs of answer (false-beep guard)
 
   const toMember = (x) => (typeof x === 'string'
     ? { number: clean(x) }
@@ -338,7 +405,7 @@ app.post('/api/call', async (req, res) => {
 
   const run = {
     id: runId, mode, from, fromPool, logToSf, resultWebhook,
-    ringTimeout, beepTimeout, agentTimeout, dropDelay,
+    ringTimeout, beepTimeout, agentTimeout, dropDelay, minGreeting,
     legs: {}, nextIdx: 0, active: 0, counts: {}, finished: false,
     createdAt: Date.now(),
   };
@@ -522,12 +589,13 @@ app.post('/webhooks/events', async (req, res) => {
   if (!eventSignatureOk(req)) { addLog(runId, 'event with BAD signature ignored', 'bad'); return; }
   if (status && !['machine', 'human'].includes(status)) addLog(runId, `leg ${legId + 1} status: ${status}`);
   if (!run || !leg) return;
+  if (status === 'answered' && !leg.answeredAt) leg.answeredAt = Date.now();
 
   // ANY terminal status frees the leg - a failed/busy/unanswered call never
   // sends 'completed', and treating only 'completed' as terminal stalls a slot.
   const TERMINAL = ['completed', 'failed', 'rejected', 'busy', 'unanswered', 'timeout', 'cancelled'];
   if (TERMINAL.includes(status)) {
-    if (leg.dropTimer) { clearTimeout(leg.dropTimer); leg.dropTimer = null; }
+    for (const t of ['dropTimer', 'hangTimer', 'watchdog']) { if (leg[t]) { clearTimeout(leg[t]); leg[t] = null; } }
     if (!leg.done && status === 'completed') addLog(runId, `leg ${legId + 1} - ended before detection`);
     finishLeg(runId, legId, leg.outcome || (status === 'completed' ? (leg.done ? 'completed' : 'no_answer') : status));
     return;
@@ -587,16 +655,22 @@ app.post('/webhooks/events', async (req, res) => {
 
   if (status === 'machine') {
     addLog(runId, `leg ${legId + 1} MACHINE detected` + (sub ? ` (${sub})` : ''), 'warn');
+    // (A) notify the CRM the MOMENT a machine is detected - once, and separate
+    // from the "message left" hook that follows. Andrew/David wanted the info ASAP.
+    if (!leg.machineNotified) {
+      leg.machineNotified = true;
+      logSf(runId, legId, 'machine_detected', 'Answering machine detected.');
+      pushDetection(run, legId);
+    }
     const atBeep = sub === 'beep_start' || sub === 'beep_timeout';
 
     if (run.mode === 'drop') {
       if (leg.transferred) return;
-      // Leave the voicemail message. The ideal moment is right after the beep,
-      // but many carrier voicemails never send a clean beep event - they fire a
-      // bare 'machine' signal and nothing else. Waiting for a beep that never
-      // comes is exactly why messages were coming out blank / logged "no answer".
-      // So: drop the moment we hear the beep, and if no beep arrives shortly
-      // after the machine is detected, drop anyway.
+      // Leave the voicemail message, then hang up as soon as it finishes. The
+      // ideal moment is right after the beep, but carrier voicemails are
+      // unreliable: some never send a beep, some fire a FALSE beep at t=0 (a
+      // greeting artefact). So we drop on a beep only once past a minimum
+      // greeting window, and if no beep arrives we drop anyway after a delay.
       const doDrop = async () => {
         if (leg.transferred) return;
         leg.transferred = true; leg.done = true;
@@ -608,20 +682,33 @@ app.post('/webhooks/events', async (req, res) => {
         if (r.status < 300) {
           leg.outcome = 'machine_message_dropped';
           addLog(runId, `leg ${legId + 1} - ${msgLabel(run)} left on the voicemail`, 'good');
-          logSf(runId, legId, 'machine', 'Answering machine detected; voicemail message left.');
+          logSf(runId, legId, 'machine_message_left', 'Voicemail message left.');
+          // (B) hang up the moment the message ends instead of waiting for the
+          // voicemail's max-length timeout (which kept the leg open too long).
+          const durMs = messageDurationMs(run);
+          leg.hangTimer = setTimeout(() => {
+            api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'hangup' }).catch(() => {});
+            addLog(runId, `leg ${legId + 1} - message finished (~${Math.round(durMs / 1000)}s), hanging up`, 'info');
+          }, durMs + 1500);
         } else {
           leg.outcome = 'drop_failed';
           addLog(runId, `leg ${legId + 1} drop FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
         }
       };
-      if (atBeep) { await doDrop(); return; }   // heard the beep (or Vonage timed out waiting for one) -> drop now
-      // first bare 'machine' signal: give the beep a brief window, then drop regardless
+      // (C) ignore a beep that arrives before the greeting could plausibly finish
+      // - that "beep" is an artefact, and dropping then plays into the greeting
+      // (before recording starts) and leaves a blank message.
+      const MIN_GREETING = (run.minGreeting || 3) * 1000;
+      const since = Date.now() - (leg.answeredAt || leg.startedAt || Date.now());
+      if (atBeep && since >= MIN_GREETING) { await doDrop(); return; } // a real beep -> drop now
+      if (atBeep) addLog(runId, `leg ${legId + 1} - ignoring an early beep at ${(since / 1000).toFixed(1)}s (likely a greeting artefact)`, 'warn');
+      // bare 'machine' (or an ignored early beep): wait briefly for a real beep, then drop regardless
       if (!leg.dropTimer) {
         const waitMs = (run.dropDelay || 12) * 1000; // ~ when a real voicemail recording begins
         addLog(runId, `leg ${legId + 1} - machine detected; will leave the message on the beep, or in ${waitMs / 1000}s if no beep`);
         leg.dropTimer = setTimeout(() => { doDrop().catch(() => {}); }, waitMs);
       }
-      return; // 'completed' fires when the stream finishes
+      return; // 'completed' fires when we hang up after the message
     }
 
     // transfer modes: act on the FIRST machine signal - do NOT wait for a beep.
