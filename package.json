@@ -7,6 +7,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@vonage/vcr-sdk": "^2.1.6",
     "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2",
     "ws": "^8.18.0"
