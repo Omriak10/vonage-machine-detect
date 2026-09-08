@@ -109,7 +109,9 @@ async function members(campaignId) {
 //         'live'    -> a live conversation happened
 async function logActivity(whoId, kind, detail) {
   if (!isConfigured() || !whoId) return { skipped: true };
-  const subject = kind === 'machine'
+  const subject = kind === 'machine_detected'
+    ? 'Machine detect - answering machine detected'
+    : (kind === 'machine' || kind === 'machine_message_left')
     ? 'Machine detect - answering machine, message left'
     : kind === 'live'
       ? 'Machine detect - live conversation'
