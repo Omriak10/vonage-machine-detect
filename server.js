@@ -265,8 +265,9 @@ async function placeLeg(runId, legId) {
   const amd = {
     behavior: 'continue',
     mode: wantsHuman ? 'detect' : 'detect_beep',
-    beep_timeout: run.beepTimeout || 45, // mandatory for AMD (30-120s) whatever the mode
+    beep_timeout: run.beepTimeout || 30, // Vonage waits up to this for the beep, then fires beep_timeout (min 30)
   };
+  run.amdMode = amd.mode; // so the event handler knows whether to wait for beep events
   const { status, data } = await api('POST', 'https://api.nexmo.com/v1/calls', {
     to: [{ type: 'phone', number: m.number }],
     from: { type: 'phone', number: fromNum },
@@ -471,7 +472,7 @@ app.post('/api/call', async (req, res) => {
   // ---- configurable timeouts (seconds). All optional, with safe defaults ----
   const num = (v, def, lo, hi) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def; };
   const ringTimeout = num(b.ringTimeout, 45, 5, 120);   // ring the called party this long, then hang up (no answer)
-  const beepTimeout = num(b.beepTimeout, 45, 30, 120);  // AMD: wait this long for the voicemail beep
+  const beepTimeout = num(b.beepTimeout, 30, 30, 120);  // AMD: Vonage waits up to this for the beep, then emits beep_timeout (min 30)
   const agentTimeout = num(b.agentTimeout, 45, 5, 120); // ring the agent/forward this long on transfer, then give up
   const dropDelay = num(b.dropDelay, 12, 2, 30);        // drop mode: if no beep event, leave the message this long after machine detection
   const minGreeting = num(b.minGreeting, 3, 0, 20);     // drop mode: ignore any "beep" within this many secs of answer (false-beep guard)
@@ -783,12 +784,17 @@ app.post('/webhooks/events', async (req, res) => {
       // (before recording starts) and leaves a blank message.
       const MIN_GREETING = (run.minGreeting || 3) * 1000;
       const since = Date.now() - (leg.answeredAt || leg.startedAt || Date.now());
-      if (atBeep && since >= MIN_GREETING) { await doDrop(); return; } // a real beep -> drop now
+      if (atBeep && since >= MIN_GREETING) { await doDrop(); return; } // real beep OR Vonage's beep_timeout -> drop the message now, right after the beep
       if (atBeep) addLog(runId, `leg ${legId + 1} - ignoring an early beep at ${(since / 1000).toFixed(1)}s (likely a greeting artefact)`, 'warn');
-      // bare 'machine' (or an ignored early beep): wait briefly for a real beep, then drop regardless
+      // bare 'machine' (no beep yet). In detect_beep mode Vonage still owes us a
+      // beep_start or beep_timeout event, so WAIT for it - dropping too early
+      // plays the message into the greeting, before the recording starts, and
+      // leaves a blank voicemail. Only fall back if that event never arrives.
       if (!leg.dropTimer) {
-        const waitMs = (run.dropDelay || 12) * 1000; // ~ when a real voicemail recording begins
-        addLog(runId, `leg ${legId + 1} - machine detected; will leave the message on the beep, or in ${waitMs / 1000}s if no beep`);
+        const waitMs = run.amdMode === 'detect_beep'
+          ? ((run.beepTimeout || 30) + 8) * 1000  // let beep_start / beep_timeout arrive first
+          : (run.dropDelay || 12) * 1000;         // detect mode gets no beep events -> short hold then drop
+        addLog(runId, `leg ${legId + 1} - machine detected; leaving the message on the beep` + (run.amdMode === 'detect_beep' ? ` (or after ${waitMs / 1000}s if Vonage reports no beep)` : ` in ${waitMs / 1000}s`));
         leg.dropTimer = setTimeout(() => { doDrop().catch(() => {}); }, waitMs);
       }
       return; // 'completed' fires when we hang up after the message
