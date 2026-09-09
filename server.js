@@ -184,11 +184,43 @@ function parseMembers(text) {
 
 // the NCCO played into a voicemail for a given run
 function dropNcco(run) {
+  // level: 1 = maximum playback volume (range -1..1, default 0). Voicemails were
+  // recording the message too quietly at the default level.
   if (run.messageId && messages[run.messageId]) {
-    return [{ action: 'stream', streamUrl: [HOST + '/message/' + run.messageId + '.wav'] }];
+    return [{ action: 'stream', streamUrl: [HOST + '/message/' + run.messageId + '.wav'], level: 1 }];
   }
-  if (dropMessage) return [{ action: 'stream', streamUrl: [HOST + '/message.wav'] }];
-  return [{ action: 'talk', text: AUTO_MESSAGE, language: AUTO_LANG, style: 2 }];
+  if (dropMessage) return [{ action: 'stream', streamUrl: [HOST + '/message.wav'], level: 1 }];
+  return [{ action: 'talk', text: AUTO_MESSAGE, language: AUTO_LANG, level: 1, premium: true }];
+}
+
+// Peak-normalise a 16-bit PCM WAV up to near full scale so the message records
+// loudly. Only boosts (never attenuates), caps the gain so it doesn't blow up
+// background hiss, and is a no-op for non-PCM16 input.
+function boostWav(buf, targetFrac = 0.97, maxGain = 12) {
+  try {
+    if (!(buf && buf.length > 44 && buf.toString('ascii', 0, 4) === 'RIFF')) return buf;
+    let o = 12, dataStart = -1, dataLen = 0, bits = 16, fmt = 1;
+    while (o + 8 <= buf.length) {
+      const id = buf.toString('ascii', o, o + 4); const sz = buf.readUInt32LE(o + 4);
+      if (id === 'fmt ') { fmt = buf.readUInt16LE(o + 8); bits = buf.readUInt16LE(o + 8 + 14); }
+      else if (id === 'data') { dataStart = o + 8; dataLen = sz; break; }
+      o += 8 + sz + (sz & 1);
+    }
+    if (dataStart < 0 || fmt !== 1 || bits !== 16) return buf;
+    const end = Math.min(dataStart + dataLen, buf.length - ((buf.length - dataStart) % 2));
+    let peak = 1;
+    for (let i = dataStart; i + 1 < end; i += 2) { const s = Math.abs(buf.readInt16LE(i)); if (s > peak) peak = s; }
+    let gain = (targetFrac * 32767) / peak;
+    if (gain > maxGain) gain = maxGain;
+    if (gain <= 1.05) return buf; // already loud enough
+    const out = Buffer.from(buf);
+    for (let i = dataStart; i + 1 < end; i += 2) {
+      let v = Math.round(buf.readInt16LE(i) * gain);
+      if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+      out.writeInt16LE(v, i);
+    }
+    return out;
+  } catch (e) { return buf; }
 }
 const msgLabel = (run) => run.messageId && messages[run.messageId]
   ? `message "${messages[run.messageId].name}"` : (dropMessage ? 'default recorded message' : 'automatic message');
@@ -261,13 +293,15 @@ async function placeLeg(runId, legId) {
   // voicemail-drop runs. When the run forwards a human to an agent/SIP (or is a
   // transfer mode), use plain `detect`, which classifies live people accurately
   // and faster; machines are still detected (we drop after the fallback delay).
-  const wantsHuman = run.mode !== 'drop' || run.humanAction === 'forward' || run.humanAction === 'sip';
+  // Always use `detect` (not `detect_beep`): Vonage's beep event fires falsely
+  // during real voicemail greetings, so we time the message drop from ANSWER
+  // instead of the beep. `detect` is also more accurate at spotting live humans.
   const amd = {
     behavior: 'continue',
-    mode: wantsHuman ? 'detect' : 'detect_beep',
-    beep_timeout: run.beepTimeout || 30, // Vonage waits up to this for the beep, then fires beep_timeout (min 30)
+    mode: 'detect',
+    beep_timeout: run.beepTimeout || 30,
   };
-  run.amdMode = amd.mode; // so the event handler knows whether to wait for beep events
+  run.amdMode = amd.mode;
   const { status, data } = await api('POST', 'https://api.nexmo.com/v1/calls', {
     to: [{ type: 'phone', number: m.number }],
     from: { type: 'phone', number: fromNum },
@@ -292,15 +326,12 @@ async function placeLeg(runId, legId) {
   }
   leg.uuid = data.uuid;
   leg.startedAt = Date.now();
-  // live-listen: join a websocket to the same conversation as a MUTED
-  // (listen-only) participant, so browsers can listen without touching the
-  // caller's media path. Fire-and-forget - a failure never affects the call.
   leg.conv = 'md-' + runId + '-' + legId;
-  api('POST', 'https://api.nexmo.com/v1/calls', {
-    to: [{ type: 'websocket', uri: WS_HOST + '/socket/vonage?sid=' + runId, 'content-type': 'audio/l16;rate=16000' }],
-    from: { type: 'phone', number: fromNum },
-    ncco: [{ action: 'conversation', name: leg.conv, startOnEnter: false, endOnExit: false, canSpeak: [] }],
-  }).then((r) => { if (r && r.data && r.data.uuid) leg.wsUuid = r.data.uuid; }).catch(() => {});
+  // NOTE: no live-listen websocket is joined. A muted 16 kHz (audio/l16)
+  // websocket participant dragged the whole conversation down to that codec,
+  // which made the dropped message blurry and quiet and confused AMD's beep
+  // detection. The console "listen" feature isn't used here, so it's dropped
+  // in favour of clean, full-quality audio for the message and the transfer.
   // safety net: if Vonage never sends a terminal event (missed webhook, etc.)
   // finalize the leg anyway so a call result is ALWAYS sent.
   const wdMs = ((run.ringTimeout || 45) + (run.beepTimeout || 45) + 120) * 1000;
@@ -474,7 +505,7 @@ app.post('/api/call', async (req, res) => {
   const ringTimeout = num(b.ringTimeout, 45, 5, 120);   // ring the called party this long, then hang up (no answer)
   const beepTimeout = num(b.beepTimeout, 30, 30, 120);  // AMD: Vonage waits up to this for the beep, then emits beep_timeout (min 30)
   const agentTimeout = num(b.agentTimeout, 45, 5, 120); // ring the agent/forward this long on transfer, then give up
-  const dropDelay = num(b.dropDelay, 12, 2, 30);        // drop mode: if no beep event, leave the message this long after machine detection
+  const dropDelay = num(b.dropDelay, 7, 2, 45);         // drop mode: play the voicemail message this many seconds AFTER answer (past greeting + tone); tunable per call
   const minGreeting = num(b.minGreeting, 3, 0, 20);     // drop mode: ignore any "beep" within this many secs of answer (false-beep guard)
 
   const toMember = (x) => (typeof x === 'string'
@@ -562,17 +593,18 @@ app.get('/api/run/:id', (req, res) => {
 // POST         -> replaces the unnamed default (back-compat)
 app.post('/api/message', express.raw({ type: '*/*', limit: '15mb' }), (req, res) => {
   if (!req.body || req.body.length < 1000) return res.status(400).json({ error: 'empty recording' });
+  const audio = boostWav(req.body); // normalise/amplify so it records loudly
   const name = String(req.query.name || '').trim();
   if (name) {
     const id = crypto.randomUUID().slice(0, 8);
     const file = path.join(MSG_DIR, `md-msg-${id}.wav`);
-    try { fs.writeFileSync(file, req.body); } catch (e) { return res.status(500).json({ error: e.message }); }
-    messages[id] = { name, bytes: req.body.length, file };
+    try { fs.writeFileSync(file, audio); } catch (e) { return res.status(500).json({ error: e.message }); }
+    messages[id] = { name, bytes: audio.length, file };
     saveMsgIndex();
-    addLog('msg', `named message "${name}" saved (${Math.round(req.body.length / 1024)} KB) - id ${id}`, 'good');
-    return res.json({ ok: true, id, name, bytes: req.body.length });
+    addLog('msg', `named message "${name}" saved (${Math.round(audio.length / 1024)} KB) - id ${id}`, 'good');
+    return res.json({ ok: true, id, name, bytes: audio.length });
   }
-  dropMessage = req.body;
+  dropMessage = audio;
   try { fs.writeFileSync(MSG_PATH, dropMessage); } catch {}
   addLog('msg', `default message saved (${Math.round(dropMessage.length / 1024)} KB)`, 'good');
   // persist durably so it survives a restart / redeploy (customer self-serve).
@@ -746,15 +778,16 @@ app.post('/webhooks/events', async (req, res) => {
       logSf(runId, legId, 'machine_detected', 'Answering machine detected.');
       pushDetection(run, legId);
     }
-    const atBeep = sub === 'beep_start' || sub === 'beep_timeout';
-
     if (run.mode === 'drop') {
-      if (leg.transferred) return;
-      // Leave the voicemail message, then hang up as soon as it finishes. The
-      // ideal moment is right after the beep, but carrier voicemails are
-      // unreliable: some never send a beep, some fire a FALSE beep at t=0 (a
-      // greeting artefact). So we drop on a beep only once past a minimum
-      // greeting window, and if no beep arrives we drop anyway after a delay.
+      if (leg.transferred || leg.dropTimer) return; // already handling this leg
+      // Leave the voicemail message, then hang up when it finishes.
+      // We do NOT trust Vonage's beep event: on real voicemails it fires a FALSE
+      // beep during the greeting (verified - message played over the greeting and
+      // the recording, which only starts after the real tone, captured silence).
+      // Instead we wait a fixed window AFTER ANSWER so the greeting and the real
+      // "leave a message after the tone" have passed, then play - and, crucially,
+      // we let the message keep playing (no early hang-up) so it lands in the
+      // recording even if our timing is a little early.
       const doDrop = async () => {
         if (leg.transferred) return;
         leg.transferred = true; leg.done = true;
@@ -767,36 +800,24 @@ app.post('/webhooks/events', async (req, res) => {
           leg.outcome = 'machine_message_dropped';
           addLog(runId, `leg ${legId + 1} - ${msgLabel(run)} left on the voicemail`, 'good');
           logSf(runId, legId, 'machine_message_left', 'Voicemail message left.');
-          // (B) hang up the moment the message ends instead of waiting for the
-          // voicemail's max-length timeout (which kept the leg open too long).
+          // hang up a few seconds after the message ends (buffer so the tail is
+          // fully recorded), rather than waiting for the voicemail max-length.
           const durMs = messageDurationMs(run);
           leg.hangTimer = setTimeout(() => {
             api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'hangup' }).catch(() => {});
             addLog(runId, `leg ${legId + 1} - message finished (~${Math.round(durMs / 1000)}s), hanging up`, 'info');
-          }, durMs + 1500);
+          }, durMs + 3000);
         } else {
           leg.outcome = 'drop_failed';
           addLog(runId, `leg ${legId + 1} drop FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
         }
       };
-      // (C) ignore a beep that arrives before the greeting could plausibly finish
-      // - that "beep" is an artefact, and dropping then plays into the greeting
-      // (before recording starts) and leaves a blank message.
-      const MIN_GREETING = (run.minGreeting || 3) * 1000;
-      const since = Date.now() - (leg.answeredAt || leg.startedAt || Date.now());
-      if (atBeep && since >= MIN_GREETING) { await doDrop(); return; } // real beep OR Vonage's beep_timeout -> drop the message now, right after the beep
-      if (atBeep) addLog(runId, `leg ${legId + 1} - ignoring an early beep at ${(since / 1000).toFixed(1)}s (likely a greeting artefact)`, 'warn');
-      // bare 'machine' (no beep yet). In detect_beep mode Vonage still owes us a
-      // beep_start or beep_timeout event, so WAIT for it - dropping too early
-      // plays the message into the greeting, before the recording starts, and
-      // leaves a blank voicemail. Only fall back if that event never arrives.
-      if (!leg.dropTimer) {
-        const waitMs = run.amdMode === 'detect_beep'
-          ? ((run.beepTimeout || 30) + 8) * 1000  // let beep_start / beep_timeout arrive first
-          : (run.dropDelay || 12) * 1000;         // detect mode gets no beep events -> short hold then drop
-        addLog(runId, `leg ${legId + 1} - machine detected; leaving the message on the beep` + (run.amdMode === 'detect_beep' ? ` (or after ${waitMs / 1000}s if Vonage reports no beep)` : ` in ${waitMs / 1000}s`));
-        leg.dropTimer = setTimeout(() => { doDrop().catch(() => {}); }, waitMs);
-      }
+      // schedule the drop for a fixed delay AFTER ANSWER (past greeting + tone).
+      const answeredAt = leg.answeredAt || leg.startedAt || Date.now();
+      const dropAtMs = (run.dropDelay || 15) * 1000; // seconds after answer to start the message
+      const waitMs = Math.max(1000, answeredAt + dropAtMs - Date.now());
+      addLog(runId, `leg ${legId + 1} - machine detected; leaving the message ${Math.round(waitMs / 1000)}s after answer (past the greeting/tone)`);
+      leg.dropTimer = setTimeout(() => { doDrop().catch(() => {}); }, waitMs);
       return; // 'completed' fires when we hang up after the message
     }
 
