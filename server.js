@@ -36,8 +36,11 @@
 //   humanAction    drop: skip (default) | forward | sip
 //   humanForward   drop + humanAction=forward: phone number for live answers
 //   sipUri         drop + humanAction=sip: sip:...@... endpoint (e.g. VCC)
-//   sipHeaders     drop + humanAction=sip: {header: value} - values support
-//                  {{whoId}} {{number}} {{name}} {{runId}} {{legId}} templates
+//   vccNumber      drop + humanAction=sip: VCC landing number; builds the URI
+//   vccRegion      drop + humanAction=sip: us|eu|ap (default eu) for the VCC
+//                  pseudo-domain sip:<vccNumber>@vcc-<region>.api.vonage.com
+//   sipHeaders     drop + humanAction=sip: {X-header: value} passed to VCC -
+//                  values support {{whoId}} {{number}} {{name}} {{runId}} {{legId}}
 //   resultWebhook  optional https URL - every call outcome is POSTed there
 //   from, logToSf  as before
 const express = require('express');
@@ -545,8 +548,18 @@ app.post('/api/call', async (req, res) => {
       if (run.humanForward.length < 7) return res.status(400).json({ error: 'humanForward number required for humanAction=forward' });
     }
     if (run.humanAction === 'sip') {
+      // Either give a full sipUri, or - to forward to Vonage Contact Center (VCC)
+      // - give vccNumber (the VCC landing number) and vccRegion (us|eu|ap) and we
+      // build the pseudo-domain URI: sip:<vccNumber>@vcc-<region>.api.vonage.com
       run.sipUri = String(b.sipUri || '').trim();
-      if (!/^sips?:/.test(run.sipUri)) return res.status(400).json({ error: 'sipUri (sip:...) required for humanAction=sip' });
+      if (!run.sipUri && b.vccNumber) {
+        const region = ({ us: 'vcc-us', eu: 'vcc-eu', ap: 'vcc-ap' })[String(b.vccRegion || 'eu').toLowerCase()] || 'vcc-eu';
+        const vnum = clean(b.vccNumber).replace(/[^\d+]/g, '');
+        run.sipUri = `sip:${vnum}@${region}.api.vonage.com`;
+      }
+      if (!/^sips?:/.test(run.sipUri)) return res.status(400).json({ error: 'humanAction=sip needs sipUri (sip:...) OR vccNumber (+ optional vccRegion us|eu|ap)' });
+      // X- prefixed headers are passed through to the SIP endpoint (VCC uses them
+      // to route / populate the agent screen; requires the Customer Proxy Trunk).
       run.sipHeaders = (b.sipHeaders && typeof b.sipHeaders === 'object' && !Array.isArray(b.sipHeaders)) ? b.sipHeaders : {};
     }
     runs[runId] = run;
