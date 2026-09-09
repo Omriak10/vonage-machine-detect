@@ -232,6 +232,21 @@ function tmpl(v, run, legId, m) {
     .replace(/\{\{\s*legId\s*\}\}/g, String(legId));
 }
 
+// Bridge a second party (agent phone / SIP) to the caller by DIALLING THEM
+// INTO THE CALLER'S CONVERSATION - not by transferring the caller's leg.
+// Transferring an AMD-held leg into a `connect` produced a bridge with no
+// working media (the far end answered then dropped after ~4-5s, on mobile and
+// SIP alike). Adding both parties to one conversation lets it mix the audio
+// properly, so both sides can actually hear each other.
+async function bridgeIntoConversation(run, leg, endpoint) {
+  return api('POST', 'https://api.nexmo.com/v1/calls', {
+    to: [endpoint],
+    from: { type: 'phone', number: leg.from || run.from },
+    ringing_timer: run.agentTimeout || 45,
+    ncco: [{ action: 'conversation', name: leg.conv, startOnEnter: true, endOnExit: true }],
+  });
+}
+
 async function placeLeg(runId, legId) {
   const run = runs[runId];
   const m = run.list[legId];
@@ -241,9 +256,15 @@ async function placeLeg(runId, legId) {
   const fromNum = run.fromPool[legId % run.fromPool.length];
   const leg = { m, from: fromNum, uuid: null, transferred: false, done: false, outcome: null };
   run.legs[legId] = leg; // active slot was reserved by launchNext
+  // `detect_beep` hunts for the voicemail beep and so leans towards "machine" -
+  // it can misread a live person's "hello" as a machine. Only use it for pure
+  // voicemail-drop runs. When the run forwards a human to an agent/SIP (or is a
+  // transfer mode), use plain `detect`, which classifies live people accurately
+  // and faster; machines are still detected (we drop after the fallback delay).
+  const wantsHuman = run.mode !== 'drop' || run.humanAction === 'forward' || run.humanAction === 'sip';
   const amd = {
     behavior: 'continue',
-    mode: run.mode === 'drop' ? 'detect_beep' : 'detect', // only message-drops wait for the beep; transfer/detect act on first machine signal
+    mode: wantsHuman ? 'detect' : 'detect_beep',
     beep_timeout: run.beepTimeout || 45, // mandatory for AMD (30-120s) whatever the mode
   };
   const { status, data } = await api('POST', 'https://api.nexmo.com/v1/calls', {
@@ -253,12 +274,14 @@ async function placeLeg(runId, legId) {
     ringing_timer: run.ringTimeout || 45, // ring this long with no answer, then hang up (unanswered)
     event_url: [HOST + '/webhooks/events?sid=' + runId + '&leg=' + legId],
     ncco: [
-      // websocket leg keeps the call alive while AMD runs AND feeds live listen
-      { action: 'connect', from: fromNum, endpoint: [{
-        type: 'websocket',
-        uri: WS_HOST + '/socket/vonage?sid=' + runId,
-        'content-type': 'audio/l16;rate=16000',
-      }] },
+      // Hold the caller in a CONVERSATION (not a peer-bridge to the websocket)
+      // while AMD runs. A peer `connect` to the websocket monopolised the
+      // caller's single media bridge: a one-way stream (voicemail drop) still
+      // played, but a later two-way `connect` (forward to an agent / SIP) came
+      // out MUTED. A conversation handles multi-party media, so the transfer
+      // bridges with clean audio. The live-listen websocket is joined to the
+      // same conversation below as a muted, listen-only participant.
+      { action: 'conversation', name: 'md-' + runId + '-' + legId, endOnExit: true },
     ],
   });
   if (status >= 300 || !data.uuid) {
@@ -268,6 +291,15 @@ async function placeLeg(runId, legId) {
   }
   leg.uuid = data.uuid;
   leg.startedAt = Date.now();
+  // live-listen: join a websocket to the same conversation as a MUTED
+  // (listen-only) participant, so browsers can listen without touching the
+  // caller's media path. Fire-and-forget - a failure never affects the call.
+  leg.conv = 'md-' + runId + '-' + legId;
+  api('POST', 'https://api.nexmo.com/v1/calls', {
+    to: [{ type: 'websocket', uri: WS_HOST + '/socket/vonage?sid=' + runId, 'content-type': 'audio/l16;rate=16000' }],
+    from: { type: 'phone', number: fromNum },
+    ncco: [{ action: 'conversation', name: leg.conv, startOnEnter: false, endOnExit: false, canSpeak: [] }],
+  }).then((r) => { if (r && r.data && r.data.uuid) leg.wsUuid = r.data.uuid; }).catch(() => {});
   // safety net: if Vonage never sends a terminal event (missed webhook, etc.)
   // finalize the leg anyway so a call result is ALWAYS sent.
   const wdMs = ((run.ringTimeout || 45) + (run.beepTimeout || 45) + 120) * 1000;
@@ -290,6 +322,7 @@ function finishLeg(runId, legId, outcome, detail) {
   const leg = run.legs[legId];
   if (!leg || leg.finished) return;
   for (const t of ['dropTimer', 'hangTimer', 'watchdog']) { if (leg[t]) { clearTimeout(leg[t]); leg[t] = null; } }
+  if (leg.wsUuid) { api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.wsUuid, { action: 'hangup' }).catch(() => {}); leg.wsUuid = null; }
   leg.finished = true; leg.done = true; leg.outcome = outcome;
   run.active = Math.max(0, run.active - 1);
   run.counts[outcome] = (run.counts[outcome] || 0) + 1;
@@ -661,35 +694,33 @@ app.post('/webhooks/events', async (req, res) => {
       // custom headers carry agent id / CRM record id for the screen pop.
       const headers = {};
       for (const [k, v] of Object.entries(run.sipHeaders || {})) headers[k] = tmpl(v, run, legId, leg.m);
-      addLog(runId, `HUMAN detected - transferring to agent (${run.sipUri})`, 'good');
-      const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
-        action: 'transfer',
-        destination: { type: 'ncco', ncco: [
-          { action: 'connect', from: leg.from || run.from, timeout: run.agentTimeout || 45,
-            endpoint: [{ type: 'sip', uri: run.sipUri, headers }] },
-        ] },
-      });
+      addLog(runId, `HUMAN detected - connecting SIP agent (${run.sipUri}) into the call`, 'good');
+      const r = await bridgeIntoConversation(run, leg, { type: 'sip', uri: run.sipUri, headers });
       if (r.status < 300) {
-        leg.outcome = 'human_transferred';
-        addLog(runId, `leg ${legId + 1} TRANSFERRED to SIP agent`, 'good');
-        logSf(runId, legId, 'live', 'A person answered; call transferred to a live agent.');
+        leg.outcome = 'human_transferred'; leg.agentUuid = r.data && r.data.uuid;
+        if (leg.watchdog) { clearTimeout(leg.watchdog); leg.watchdog = null; } // bridged call can outlast the watchdog; it will 'completed' naturally
+        addLog(runId, `leg ${legId + 1} - SIP agent connected into the call`, 'good');
+        logSf(runId, legId, 'live', 'A person answered; call connected to a live agent.');
       } else {
         leg.outcome = 'transfer_failed';
-        addLog(runId, `leg ${legId + 1} SIP transfer FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
+        addLog(runId, `leg ${legId + 1} SIP connect FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
+        await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'hangup' }).catch(() => {});
       }
-      return; // 'completed' fires when the bridged call ends
+      return; // 'completed' fires when the conversation ends
     }
     if (run.mode === 'drop' && run.humanAction === 'forward') {
-      addLog(runId, `HUMAN detected - transferring to ${run.humanForward}`, 'good');
-      const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
-        action: 'transfer',
-        destination: { type: 'ncco', ncco: [
-          { action: 'connect', from: leg.from || run.from, timeout: run.agentTimeout || 45, endpoint: [{ type: 'phone', number: run.humanForward }] },
-        ] },
-      });
-      leg.outcome = r.status < 300 ? 'human_transferred' : 'transfer_failed';
-      if (r.status < 300) logSf(runId, legId, 'live', `A person answered; call transferred to ${run.humanForward}.`);
-      else addLog(runId, `leg ${legId + 1} transfer FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
+      addLog(runId, `HUMAN detected - connecting ${run.humanForward} into the call`, 'good');
+      const r = await bridgeIntoConversation(run, leg, { type: 'phone', number: run.humanForward });
+      if (r.status < 300) {
+        leg.outcome = 'human_transferred'; leg.agentUuid = r.data && r.data.uuid;
+        if (leg.watchdog) { clearTimeout(leg.watchdog); leg.watchdog = null; } // bridged call can outlast the watchdog; it will 'completed' naturally
+        addLog(runId, `leg ${legId + 1} - ${run.humanForward} connected into the call`, 'good');
+        logSf(runId, legId, 'live', `A person answered; call connected to ${run.humanForward}.`);
+      } else {
+        leg.outcome = 'transfer_failed';
+        addLog(runId, `leg ${legId + 1} connect FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
+        await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'hangup' }).catch(() => {});
+      }
       return;
     }
     // default: humans are the point in transfer modes / skipped in drop mode
@@ -778,20 +809,16 @@ app.post('/webhooks/events', async (req, res) => {
       logSf(runId, legId, 'machine', 'Answering machine / voicemail reached - no message left.');
       return;
     }
-    const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
-      action: 'transfer',
-      destination: { type: 'ncco', ncco: [
-        { action: 'connect', from: leg.from || run.from, timeout: run.agentTimeout || 45, endpoint: [{ type: 'phone', number: run.forward }] },
-      ] },
-    });
+    const r = await bridgeIntoConversation(run, leg, { type: 'phone', number: run.forward });
     if (r.status < 300) {
-      leg.outcome = 'machine_transferred';
-      addLog(runId, `TRANSFERRED to ${run.forward}`, 'good');
-      logSf(runId, legId, 'machine', `Answering machine detected; call transferred to ${run.forward}.`);
+      leg.outcome = 'machine_transferred'; leg.agentUuid = r.data && r.data.uuid;
+        if (leg.watchdog) { clearTimeout(leg.watchdog); leg.watchdog = null; } // bridged call can outlast the watchdog; it will 'completed' naturally
+      addLog(runId, `connected ${run.forward} into the call`, 'good');
+      logSf(runId, legId, 'machine', `Answering machine detected; call connected to ${run.forward}.`);
     } else {
       leg.outcome = 'transfer_failed';
       await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'hangup' }).catch(() => {}); // don't leave a blank voicemail
-      addLog(runId, 'transfer FAILED: ' + JSON.stringify(r.data).slice(0, 200), 'bad');
+      addLog(runId, 'connect FAILED: ' + JSON.stringify(r.data).slice(0, 200), 'bad');
     }
   }
 });
