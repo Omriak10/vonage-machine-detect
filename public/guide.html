@@ -134,6 +134,14 @@
       <tr><td><code>beepTimeout</code></td><td>Wait this long for the voicemail beep. Default 45.</td></tr>
       <tr><td><code>agentTimeout</code></td><td>Ring the agent this long on a transfer, then give up. Default 45.</td></tr>
       <tr><td><code>resultWebhook</code></td><td>Your HTTPS endpoint - one JSON result per callout is POSTed here.</td></tr>
+      <tr><td><code>agentMode</code></td><td>With <code>humanAction</code> sip/forward: <code>per_call</code> (default) or <code>room</code> - park the agent first, transfer humans in. See Part 6.</td></tr>
+      <tr><td><code>agents</code></td><td>Room mode: how many agent legs to park for the burst (1-10). One parked agent talks to one human at a time.</td></tr>
+      <tr><td><code>burstId</code></td><td>Room mode: your id for this burst. Written into the SalesforceID SIP header (default: the run id).</td></tr>
+      <tr><td><code>agentIds</code></td><td>Room mode: optional list, one id per parked agent, available as <code>{{agentId}}</code> in <code>sipHeaders</code>.</td></tr>
+      <tr><td><code>busyMessage</code> / <code>busyLang</code> / <code>busyMessageId</code></td><td>Room mode: what a human hears when every parked agent is busy (text + TTS language, or an uploaded message id), then we hang up.</td></tr>
+      <tr><td><code>busyWait</code></td><td>Room mode: 0 (default) = busy message at once; N = hold the human up to N seconds for an agent to free up.</td></tr>
+      <tr><td><code>agentSettle</code></td><td>Room mode: seconds after the parked leg answers before it counts as ready (lets a VCC queue route to the agent). Default 0.</td></tr>
+      <tr><td><code>detection</code></td><td><code>amd</code> (default) or <code>off</code> = no machine detection, every answer is treated as a live human.</td></tr>
     </table>
   </div></div></div>
 
@@ -163,7 +171,7 @@
   "number": "447700900461", "name": "Jane Doe", "whoId": "00Q5g000004AbCdEAA",
   "from": "447700900111",
   "answeredBy": "human",              <span class="c">// human | machine | none</span>
-  "action": "transferred_to_agent",   <span class="c">// voicemail_left | transferred_to_agent | skipped | no_answer | failed</span>
+  "action": "transferred_to_agent",   <span class="c">// voicemail_left | transferred_to_agent | agents_busy | skipped | no_answer | failed</span>
   "transferredTo": { "type": "sip", "destination": "sip:queue@yourvcc.sip.vonage.com" },
   "voicemailMessageId": null,
   "outcome": "human_transferred",
@@ -191,6 +199,59 @@
     <h3>You control every timeout</h3>
     <p><code>ringTimeout</code> = ring the person X seconds then hang up (your "if it's rung for X, drop it"). <code>beepTimeout</code> = wait for the voicemail beep. <code>agentTimeout</code> = ring the agent on a transfer then give up. All optional, all in seconds.</p>
     <div class="tip"><b>Silence after answer:</b> if a person picks up and says nothing - when an agent is free the call connects and the agent hears it; when the agent is busy we leave the voicemail and hang up; and an unanswered call is dropped after your <code>ringTimeout</code>.</div>
+  </div></div></div>
+
+  <div class="part">Part 6</div>
+  <div class="parthead">Agent room - call the agent first, transfer humans in</div>
+  <p class="partsub">The fast handover for bursts. Instead of dialling your VCC for every live answer (detection + queue + agent answer, 8-13 s), the agent is dialled once at the start of the burst and waits in a room. A live human is transferred into that room in a fraction of a second.</p>
+
+  <div class="step"><div class="t"><div class="num">1</div><div>
+    <h3>How it works</h3>
+    <p>When the run starts we dial your SIP endpoint (or phone) once per parked agent and hold that leg in a "room". Your VCC routes it to an agent as usual - that queue time is paid <b>once per burst</b>. Customers are then dialled with machine detection as before. Machines get the voicemail and never reach an agent. A <b>human</b> is transferred into a free room straight away (about 0.2 s after detection); the Salesforce activity and your webhook are sent in parallel with the transfer, never before it.</p>
+    <p>When the agent hangs up at the end of a conversation, the room closes, the customer's call ends, and the agent is dialled again for the next human while the burst is still running. When the customer hangs up first, the agent simply stays parked and takes the next human. When the burst is over, the parked legs are released.</p>
+  </div></div></div>
+
+  <div class="step"><div class="t"><div class="num">2</div><div>
+    <h3>Turn it on</h3>
+    <p><b>Console:</b> choose <b>Transfer to a SIP agent</b> (or a phone number), then under <b>Agent connection</b> pick <b>Park the agent(s) first</b>. Set how many agents to park, an optional Burst ID and the busy message, then press Call.</p>
+    <p><b>API:</b> add the room fields to <code>POST /api/call</code>:</p>
+    <pre>{
+  "mode": "drop", "numbers": "...", "from": "447700900111", "concurrency": 3,
+  "humanAction": "sip", "sipUri": "sip:+33186651653@vcc-eu.api.vonage.com",
+  "sipHeaders": { "X-NVM-AgentId": "{{agentId}}", "X-NVM-SalesforceId": "ignored - replaced by burstId" },
+  "agentMode": "room",
+  "agents": 2,                       <span class="c">// how many agent legs to park - your choice per burst</span>
+  "agentIds": ["1234", "1235"],      <span class="c">// optional, one per parked agent -> {{agentId}}</span>
+  "burstId": "BURST-2026-09-17-A",   <span class="c">// goes into the SalesforceID header of the agent legs</span>
+  "busyMessage": "Sorry, all our agents are busy right now. We will call you back shortly. Goodbye.",
+  "busyLang": "en-US",
+  "busyWait": 0,                     <span class="c">// or e.g. 15 = hold the human up to 15 s for a free agent</span>
+  "agentSettle": 0,
+  "resultWebhook": "https://your-system.example.com/hooks/md"
+}</pre>
+  </div></div></div>
+
+  <div class="step"><div class="t"><div class="num">3</div><div>
+    <h3>SIP headers on the parked agent leg</h3>
+    <p>Everything you put in <code>sipHeaders</code> is sent as is, so your agent-id header keeps its value (use <code>{{agentId}}</code> to give each parked agent its own id from <code>agentIds</code>). The header whose name contains <b>Salesforce</b> is set to the <b>burst id</b>; if you send none, we add <code>X-SalesforceID</code> with the burst id. Per-contact placeholders (<code>{{whoId}}</code>, <code>{{number}}</code>, <code>{{name}}</code>) are empty on a parked leg - it is dialled before any customer exists; use the <code>human_connected</code> webhook (below) for the contact.</p>
+  </div></div></div>
+
+  <div class="step"><div class="t"><div class="num">4</div><div>
+    <h3>When two humans answer at once</h3>
+    <p>One parked agent talks to one human at a time. If a second human is detected while every parked agent is busy, they hear the <b>busy message</b> and the call ends (result <code>action: "agents_busy"</code>). Set <code>busyWait</code> to a number of seconds to hold them instead: they hear the hold message, and the moment an agent frees up they are transferred; if nobody frees up in time, the busy message plays and the call ends. Park more agents (<code>agents</code>) to take more humans in parallel.</p>
+  </div></div></div>
+
+  <div class="step"><div class="t"><div class="num">5</div><div>
+    <h3>Extra webhook events in room mode</h3>
+    <pre>{ "event": "human_connected",    <span class="c">// the human is now talking to a parked agent - update your Salesforce record now</span>
+  "runId": "1a2b3c4d", "burstId": "BURST-2026-09-17-A", "legId": 12, "callUuid": "...",
+  "number": "447700900461", "name": "Jane Doe", "whoId": "00Q5g000004AbCdEAA",
+  "agent": 1, "agentId": "1234", "agentCallUuid": "...", "transferMs": 210, "at": "..." }
+
+{ "event": "agents_busy",        <span class="c">// a human answered but every parked agent was busy - busy message played</span>
+  "runId": "1a2b3c4d", "burstId": "BURST-2026-09-17-A", "legId": 13, "number": "...", "agents": 2, "at": "..." }</pre>
+    <p>The final <code>call_result</code> still follows for every call, with <code>action</code> = <code>transferred_to_agent</code>, <code>agents_busy</code> or <code>hung_up_while_waiting</code>.</p>
+    <div class="tip"><b>Cost:</b> the customer side is unchanged (same PSTN leg, same detection). The SIP leg to your VCC is billed for the whole time it is parked, including idle seconds between humans - cents per burst - and you no longer pay queue time on every human call.</div>
   </div></div></div>
 
 </div>

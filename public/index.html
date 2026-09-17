@@ -152,7 +152,31 @@ button:disabled{opacity:.4;cursor:default}
       <input id="sipUri" placeholder="sip:queue@yourvcc.sip.vonage.com" autocomplete="off">
       <label>Custom SIP headers (JSON)</label>
       <textarea id="sipHeaders" style="min-height:70px" placeholder='{"X-NVM-AgentId":"1234","X-NVM-RecordId":"{{whoId}}"}'></textarea>
-      <div class="hint">Values support {{whoId}}, {{number}}, {{name}} per called contact - e.g. for the agent's screen pop.</div>
+      <div class="hint">Values support {{whoId}}, {{number}}, {{name}} per called contact - e.g. for the agent's screen pop. In agent-room mode also {{burstId}} and {{agentId}}.</div>
+    </div>
+    <div id="agentModeWrap" class="hide">
+      <label>Agent connection</label>
+      <select id="agentMode" onchange="humanChanged()">
+        <option value="per_call">Dial the agent for every live answer (classic)</option>
+        <option value="room">Park the agent(s) first, transfer humans in (fastest handover)</option>
+      </select>
+      <div id="roomWrap" class="hide">
+        <div class="hint">The agent is called once at the start of the burst and waits in a room. A live human is transferred in within a fraction of a second; the queue and agent answer time are paid once per burst. Machines never reach the agent.</div>
+        <div class="row" style="gap:10px">
+          <div style="flex:1"><label>Parked agents</label><input id="agents" type="number" min="1" max="10" value="1"></div>
+          <div style="flex:2"><label>Burst ID (goes into the SalesforceID header)</label><input id="burstId" placeholder="auto = run id" autocomplete="off"></div>
+        </div>
+        <label>Agent IDs, one per parked agent (optional, {{agentId}} in headers)</label>
+        <input id="agentIds" placeholder="1234, 1235" autocomplete="off">
+        <label>Message when every agent is busy (then we hang up)</label>
+        <input id="busyMessage" value="Sorry, all our agents are busy right now. We will call you back shortly. Goodbye." autocomplete="off">
+        <div class="row" style="gap:10px">
+          <div style="flex:1"><label>Language</label><input id="busyLang" value="en-US"></div>
+          <div style="flex:1"><label>Wait for a free agent (s, 0 = none)</label><input id="busyWait" type="number" min="0" max="60" value="0"></div>
+          <div style="flex:1"><label>Agent settle after answer (s)</label><input id="agentSettle" type="number" min="0" max="30" value="0"></div>
+        </div>
+        <label class="chk"><input type="checkbox" id="detOff"> Detection off - treat every answer as a live human (testing / lists you know are live)</label>
+      </div>
     </div>
   </div>
 
@@ -186,6 +210,9 @@ function humanChanged() {
   const v = el('humanAct').value;
   el('humanFwdWrap').classList.toggle('hide', v !== 'forward');
   el('humanSipWrap').classList.toggle('hide', v !== 'sip');
+  const agentish = v === 'forward' || v === 'sip';
+  el('agentModeWrap').classList.toggle('hide', !agentish);
+  el('roomWrap').classList.toggle('hide', !(agentish && el('agentMode').value === 'room'));
 }
 async function loadLists(selectId) {
   try {
@@ -314,6 +341,19 @@ async function place() {
       body.sipUri = el('sipUri').value;
       try { body.sipHeaders = el('sipHeaders').value.trim() ? JSON.parse(el('sipHeaders').value) : {}; }
       catch (e) { alert('SIP headers must be valid JSON'); b.disabled = false; return; }
+    }
+    if (body.humanAction === 'forward' || body.humanAction === 'sip') {
+      body.agentMode = el('agentMode').value;
+      if (body.agentMode === 'room') {
+        body.agents = parseInt(el('agents').value, 10) || 1;
+        if (el('burstId').value.trim()) body.burstId = el('burstId').value.trim();
+        if (el('agentIds').value.trim()) body.agentIds = el('agentIds').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+        body.busyMessage = el('busyMessage').value;
+        body.busyLang = el('busyLang').value || 'en-US';
+        body.busyWait = parseInt(el('busyWait').value, 10) || 0;
+        body.agentSettle = parseInt(el('agentSettle').value, 10) || 0;
+        if (el('detOff').checked) body.detection = 'off';
+      }
     }
   } else { body.to = el('to').value; body.forward = el('forward').value; }
   try {

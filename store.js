@@ -24,6 +24,11 @@ function serialize(run) {
     counts: run.counts, finished: run.finished, concurrency: run.concurrency,
     messageId: run.messageId, forward: run.forward, humanAction: run.humanAction,
     humanForward: run.humanForward, sipUri: run.sipUri, sipHeaders: run.sipHeaders,
+    // agent room settings (rooms themselves are rebuilt + re-parked on resume)
+    agentMode: run.agentMode, agents: run.agents, agentIds: run.agentIds, burstId: run.burstId,
+    busyMessage: run.busyMessage, holdMessage: run.holdMessage, busyLang: run.busyLang, busyMessageId: run.busyMessageId,
+    busyWait: run.busyWait, agentSettle: run.agentSettle, detection: run.detection,
+    ringTimeout: run.ringTimeout, beepTimeout: run.beepTimeout, agentTimeout: run.agentTimeout, dropDelay: run.dropDelay, minGreeting: run.minGreeting,
     createdAt: run.createdAt,
     // per-leg: keep the call uuid + outcome so a resumed run can reconcile
     legs: Object.fromEntries(Object.entries(run.legs || {}).map(([k, l]) => [k, {

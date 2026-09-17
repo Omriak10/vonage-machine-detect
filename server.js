@@ -43,6 +43,26 @@
 //                  values support {{whoId}} {{number}} {{name}} {{runId}} {{legId}}
 //   resultWebhook  optional https URL - every call outcome is POSTed there
 //   from, logToSf  as before
+//
+// Agent room (drop + humanAction=sip|forward) - "call the agent first":
+//   agentMode      per_call (default: dial the agent for every live answer) |
+//                  room (park N agent legs for the whole burst; a live human is
+//                  TRANSFERRED into a parked agent's room in ~0.2 s, so the
+//                  VCC queue/agent-answer time is paid once per burst, not per call)
+//   agents         room: how many agent legs to park (1-10, default 1) - the
+//                  customer decides; one parked agent talks to one human at a time
+//   agentIds       room: optional [id,...] one per parked agent -> {{agentId}}
+//   burstId        room: identifier for this burst (default: the run id). It is
+//                  written into the SIP header whose name contains "salesforce"
+//                  (or X-SalesforceID if you send none) and is {{burstId}} in headers
+//   busyMessage    room: what a human hears when every parked agent is busy,
+//                  then we hang up (default English text) - or busyMessageId
+//                  (an uploaded message) ; busyLang = TTS language (en-US)
+//   busyWait       room: 0 (default) = busy message + hang up at once; >0 = hold
+//                  the human up to N seconds for an agent to free up first
+//   agentSettle    room: seconds after the parked leg answers before it counts
+//                  as ready (lets a VCC queue route to the agent), default 0
+//   detection      amd (default) | off = treat every answer as human (no AMD)
 const express = require('express');
 const http = require('http');
 const fs = require('fs');
@@ -258,13 +278,32 @@ function messageDurationMs(run) {
 
 // ---------------------------------------------------------------- calling
 // A run dials members as legs. Transfer modes are a run with a single member.
-function tmpl(v, run, legId, m) {
+function tmpl(v, run, legId, m, agentIdx) {
+  m = m || {};
+  const agentId = (Array.isArray(run.agentIds) && agentIdx != null && run.agentIds[agentIdx] != null) ? String(run.agentIds[agentIdx]) : '';
   return String(v)
     .replace(/\{\{\s*whoId\s*\}\}/g, m.whoId || '')
     .replace(/\{\{\s*number\s*\}\}/g, m.number || '')
     .replace(/\{\{\s*name\s*\}\}/g, m.name || '')
     .replace(/\{\{\s*runId\s*\}\}/g, run.id)
-    .replace(/\{\{\s*legId\s*\}\}/g, String(legId));
+    .replace(/\{\{\s*burstId\s*\}\}/g, run.burstId || run.id)
+    .replace(/\{\{\s*agentId\s*\}\}/g, agentId)
+    .replace(/\{\{\s*legId\s*\}\}/g, legId == null ? '' : String(legId));
+}
+
+// SIP headers for a PARKED agent leg (room mode): keep whatever the customer
+// sends (their agent-id header stays as is), and put the BURST id into the
+// "SalesforceID" header - David: that header isn't really used, so it carries
+// the burst id; a header named X-SalesforceID is added if none matches.
+function roomHeaders(run, agentIdx) {
+  const headers = {};
+  let sfKey = null;
+  for (const [k, v] of Object.entries(run.sipHeaders || {})) {
+    headers[k] = tmpl(v, run, null, {}, agentIdx);
+    if (/salesforce/i.test(k)) sfKey = k;
+  }
+  headers[sfKey || 'X-SalesforceID'] = String(run.burstId || run.id);
+  return headers;
 }
 
 // Bridge a second party (agent phone / SIP) to the caller by DIALLING THEM
@@ -308,7 +347,8 @@ async function placeLeg(runId, legId) {
   const { status, data } = await api('POST', 'https://api.nexmo.com/v1/calls', {
     to: [{ type: 'phone', number: m.number }],
     from: { type: 'phone', number: fromNum },
-    advanced_machine_detection: amd,
+    // detection:'off' = no AMD at all; every answer is treated as a live human
+    ...(run.detection === 'off' ? {} : { advanced_machine_detection: amd }),
     ringing_timer: run.ringTimeout || 45, // ring this long with no answer, then hang up (unanswered)
     event_url: [HOST + '/webhooks/events?sid=' + runId + '&leg=' + legId],
     ncco: [
@@ -384,7 +424,9 @@ function maybeFinishRun(runId) {
   if (run.finished || run.active > 0 || run.nextIdx < run.list.length) return;
   // any legs still not terminal? (events may still be in flight)
   if (Object.values(run.legs).some((l) => !l.finished)) return;
+  if ((run.waiting || []).length) return;
   run.finished = true;
+  unparkAll(runId); // room mode: the burst is over - release the parked agent legs
   const c = run.counts;
   if (run.mode === 'drop') {
     addLog(runId, `run finished - ${c.machine_message_dropped || 0} dropped, ${(c.human_transferred || 0)} transferred, `
@@ -403,6 +445,8 @@ function outcomeMeta(outcome) {
   if (o === 'machine_transferred')     return { answeredBy: 'machine', action: 'transferred' };
   if (o === 'machine')                 return { answeredBy: 'machine', action: 'no_message' };
   if (o === 'human_transferred')       return { answeredBy: 'human',   action: 'transferred_to_agent' };
+  if (o === 'human_busy')              return { answeredBy: 'human',   action: 'agents_busy' };        // room: no free agent - busy message played, hung up
+  if (o === 'human_waiting')           return { answeredBy: 'human',   action: 'hung_up_while_waiting' }; // room: left before an agent freed up
   if (o === 'human_skipped')           return { answeredBy: 'human',   action: 'skipped' };
   if (o === 'human')                   return { answeredBy: 'human',   action: 'live_conversation' };
   if (o === 'no_answer')               return { answeredBy: 'none',    action: 'no_answer' };
@@ -430,16 +474,21 @@ async function postWebhook(url, body, runId, label) {
 
 // immediate "answering machine detected" hook - fired the moment AMD says
 // machine, BEFORE and separate from the final result, so the CRM knows ASAP.
-function pushDetection(run, legId) {
+function pushDetection(run, legId) { pushEvent(run, legId, 'machine_detected', { answeredBy: 'machine', action: 'detected' }); }
+
+// immediate, intermediate hook (before the final call_result): machine_detected,
+// human_connected (room mode: the human is now talking to a parked agent - the
+// moment to update the Salesforce record), agents_busy (room mode).
+function pushEvent(run, legId, event, extra) {
   if (!run.resultWebhook) return;
   const leg = run.legs[legId]; if (!leg) return;
-  postWebhook(run.resultWebhook, {
-    event: 'machine_detected',
-    runId: run.id, legId, callUuid: leg.uuid, mode: run.mode,
+  postWebhook(run.resultWebhook, Object.assign({
+    event,
+    runId: run.id, burstId: run.burstId || run.id, legId, callUuid: leg.uuid, mode: run.mode,
     number: leg.m.number, name: leg.m.name || null, whoId: leg.m.whoId || null,
-    from: leg.from || run.from, answeredBy: 'machine', action: 'detected',
+    from: leg.from || run.from,
     at: new Date().toISOString(),
-  }, run.id, 'detection');
+  }, extra || {}), run.id, event);
 }
 
 // fire-and-forget: POST ONE clean JSON per callout to the client's endpoint
@@ -485,6 +534,180 @@ function logSf(runId, legId, kind, detail) {
     .then((r) => { if (r && r.id) addLog(runId, `logged to Salesforce (${String(kind).replace(/_/g, ' ')}) on ${m.name || m.whoId}`, 'info'); })
     .catch((e) => addLog(runId, 'Salesforce log failed: ' + e.message, 'bad'));
 }
+
+// ------------------------------------------------------------ agent room
+// "Call the agent first": per burst we dial the agent endpoint (VCC SIP or a
+// phone) ONCE per parked agent into a named conversation - the "room" - and
+// hold it there. When a customer is detected human, that customer's leg is
+// TRANSFERRED into a free room (a conversation-to-conversation transfer is a
+// supported move; ~0.2 s), so the handover is detection + a fraction of a
+// second instead of detection + VCC queue + agent answer. The agent leg has
+// endOnExit:true: when the agent hangs up at the end of a customer call the
+// room closes, the customer's leg completes, and we re-park the agent for the
+// next human while the burst is still running. Machines never touch a room.
+const TERMINAL_STATES = ['completed', 'failed', 'rejected', 'busy', 'unanswered', 'timeout', 'cancelled'];
+function initRooms(run) {
+  run.rooms = Array.from({ length: run.agents || 1 }, (_, i) => ({ i, name: `mdroom-${run.id}-${i + 1}`, state: 'down', uuid: null, legId: null, attempts: 0 }));
+  run.waiting = [];
+}
+function roomEndpoint(run, i) {
+  if (run.humanAction === 'sip') return { type: 'sip', uri: run.sipUri, headers: roomHeaders(run, i) };
+  return { type: 'phone', number: run.humanForward };
+}
+function roomLabel(run) { return run.humanAction === 'sip' ? run.sipUri : run.humanForward; }
+function roomStillNeeded(run) {
+  return !run.finished && !shuttingDown && (run.nextIdx < run.list.length
+    || Object.values(run.legs).some((l) => !l.finished) || (run.waiting || []).length > 0);
+}
+function parkAll(runId) { const run = runs[runId]; if (!run || !run.rooms) return; run.rooms.forEach((r, i) => setTimeout(() => parkAgent(runId, i), 200 * i)); }
+async function parkAgent(runId, i) {
+  const run = runs[runId]; if (!run || run.finished || shuttingDown || !run.rooms) return;
+  const room = run.rooms[i]; if (!room || room.state === 'parking' || room.state === 'ready' || room.state === 'busy') return;
+  room.state = 'parking'; room.uuid = null; room.legId = null; room.attempts += 1;
+  const ep = roomEndpoint(run, i);
+  const { status, data } = await api('POST', 'https://api.nexmo.com/v1/calls', {
+    to: [ep],
+    from: { type: 'phone', number: run.from },
+    ringing_timer: run.agentTimeout || 45,
+    event_url: [HOST + '/webhooks/room?sid=' + runId + '&room=' + i],
+    ncco: [{ action: 'conversation', name: room.name, startOnEnter: true, endOnExit: true }],
+  }).catch((e) => ({ status: 0, data: { error: e.message } }));
+  if (status >= 300 || !data.uuid) {
+    room.state = 'down';
+    addLog(runId, `agent ${i + 1} - park call FAILED: ` + JSON.stringify(data).slice(0, 200) + (room.attempts < 5 ? ' - retrying in 8s' : ' - giving up'), 'bad');
+    if (room.attempts < 5) setTimeout(() => { if (roomStillNeeded(run)) parkAgent(runId, i); }, 8000);
+    return;
+  }
+  room.uuid = data.uuid;
+  const hdr = ep.headers ? ' headers ' + Object.entries(ep.headers).map(([k, v]) => `${k}=${v}`).join(', ') : '';
+  addLog(runId, `agent ${i + 1} - dialling ${roomLabel(run)} into room ${room.name} (burst ${run.burstId})${hdr}`);
+}
+function unparkAll(runId) {
+  const run = runs[runId]; if (!run || !run.rooms) return;
+  for (const room of run.rooms) {
+    if (room.readyTimer) { clearTimeout(room.readyTimer); room.readyTimer = null; }
+    if (room.uuid && room.state !== 'busy') {
+      api('PUT', 'https://api.nexmo.com/v1/calls/' + room.uuid, { action: 'hangup' }).catch(() => {});
+      addLog(runId, `agent ${room.i + 1} - burst over, releasing the parked leg`);
+    }
+    if (room.state !== 'busy') { room.state = 'down'; room.uuid = null; }
+  }
+}
+// the customer leg of a room ended -> that agent is free (unless the agent hung up, which the room webhook handles)
+function releaseRoom(runId, legId) {
+  const run = runs[runId]; const leg = run && run.legs[legId]; if (!run || !leg) return;
+  if (run.waiting && run.waiting.includes(legId)) { run.waiting = run.waiting.filter((x) => x !== legId); if (!leg.outcome || leg.outcome === 'human_waiting') leg.outcome = 'human_waiting'; }
+  if (leg.room == null || !run.rooms) return;
+  const room = run.rooms[leg.room];
+  if (room && room.legId === legId) {
+    room.legId = null;
+    if (room.state === 'busy' && room.uuid) { room.state = 'ready'; addLog(runId, `agent ${room.i + 1} - free again`); serveWaiting(runId); }
+  }
+}
+function busyNcco(run) {
+  if (run.busyMessageId && messages[run.busyMessageId]) return [{ action: 'stream', streamUrl: [HOST + '/message/' + run.busyMessageId + '.wav'], level: 1 }];
+  return [{ action: 'talk', text: run.busyMessage, language: run.busyLang || 'en-US', premium: true }];
+}
+async function busyHangup(runId, legId, why) {
+  const run = runs[runId]; const leg = run.legs[legId]; if (!leg || leg.finished) return;
+  leg.outcome = 'human_busy'; leg.done = true;
+  addLog(runId, `leg ${legId + 1} - HUMAN but ${why}; playing the busy message and hanging up`, 'warn');
+  logSf(runId, legId, 'live', 'A person answered but every agent was busy; busy message played, call ended.');
+  pushEvent(run, legId, 'agents_busy', { answeredBy: 'human', action: 'agents_busy', agents: run.agents });
+  const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'transfer', destination: { type: 'ncco', ncco: busyNcco(run) } }).catch(() => ({ status: 0 }));
+  if (r.status >= 300) api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'hangup' }).catch(() => {});
+}
+async function joinRoom(runId, legId, room) {
+  const run = runs[runId]; const leg = run.legs[legId]; if (!leg || leg.finished) return false;
+  room.state = 'busy'; room.legId = legId; leg.room = room.i; leg.done = true;
+  if (leg.waitTimer) { clearTimeout(leg.waitTimer); leg.waitTimer = null; }
+  run.waiting = (run.waiting || []).filter((x) => x !== legId);
+  const t0 = Date.now();
+  const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
+    action: 'transfer',
+    destination: { type: 'ncco', ncco: [{ action: 'conversation', name: room.name, startOnEnter: true, endOnExit: false }] },
+  }).catch((e) => ({ status: 0, data: { error: e.message } }));
+  if (r.status < 300) {
+    leg.outcome = 'human_transferred'; leg.agentUuid = room.uuid;
+    if (leg.watchdog) { clearTimeout(leg.watchdog); leg.watchdog = null; }
+    const agentId = (run.agentIds || [])[room.i] || null;
+    addLog(runId, `leg ${legId + 1} - HUMAN connected to parked agent ${room.i + 1}${agentId ? ' (' + agentId + ')' : ''} in ${Date.now() - t0} ms`, 'good');
+    // Salesforce + webhook in PARALLEL with the transfer - never before it
+    logSf(runId, legId, 'live', `A person answered; connected to parked agent ${room.i + 1}${agentId ? ' (' + agentId + ')' : ''}, burst ${run.burstId}.`);
+    pushEvent(run, legId, 'human_connected', { answeredBy: 'human', action: 'transferred_to_agent', agent: room.i + 1, agentId, agentCallUuid: room.uuid, transferMs: Date.now() - t0 });
+    persist(run);
+    return true;
+  }
+  room.state = 'ready'; room.legId = null; leg.room = null;
+  leg.outcome = 'transfer_failed';
+  addLog(runId, `leg ${legId + 1} - transfer into room ${room.name} FAILED: ` + JSON.stringify(r.data).slice(0, 200), 'bad');
+  api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'hangup' }).catch(() => {});
+  return false;
+}
+async function roomConnect(runId, legId) {
+  const run = runs[runId]; const leg = run.legs[legId];
+  const room = (run.rooms || []).find((r) => r.state === 'ready');
+  if (room) return joinRoom(runId, legId, room);
+  const states = (run.rooms || []).map((r) => r.state).join('/');
+  if (run.busyWait > 0) {
+    // hold the human briefly in their own conversation, waiting for a free agent
+    leg.outcome = 'human_waiting'; leg.waitingSince = Date.now();
+    run.waiting = run.waiting || []; run.waiting.push(legId);
+    addLog(runId, `leg ${legId + 1} - HUMAN, no agent free (${states}); holding up to ${run.busyWait}s`, 'warn');
+    await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'transfer', destination: { type: 'ncco', ncco: [
+      { action: 'talk', text: run.holdMessage, language: run.busyLang || 'en-US', premium: true },
+      { action: 'conversation', name: leg.conv, endOnExit: true },
+    ] } }).catch(() => {});
+    leg.waitTimer = setTimeout(() => {
+      if (leg.finished || leg.room != null) return;
+      run.waiting = (run.waiting || []).filter((x) => x !== legId);
+      busyHangup(runId, legId, `no agent freed up within ${run.busyWait}s`);
+    }, run.busyWait * 1000);
+    return;
+  }
+  return busyHangup(runId, legId, `every parked agent is busy (${states})`);
+}
+async function serveWaiting(runId) {
+  const run = runs[runId]; if (!run || !run.waiting || !run.waiting.length) return;
+  const room = (run.rooms || []).find((r) => r.state === 'ready'); if (!room) return;
+  // the room's agent leg must still be live (guards the agent-hung-up race)
+  const chk = await api('GET', 'https://api.nexmo.com/v1/calls/' + room.uuid).catch(() => ({ status: 0, data: {} }));
+  if (chk.status >= 300 || !chk.data || chk.data.status !== 'answered') return;
+  const legId = run.waiting.shift();
+  const leg = run.legs[legId]; if (!leg || leg.finished) return serveWaiting(runId);
+  addLog(runId, `leg ${legId + 1} - agent ${room.i + 1} freed up after ${Math.round((Date.now() - (leg.waitingSince || Date.now())) / 1000)}s waiting`);
+  await joinRoom(runId, legId, room);
+}
+// events for the PARKED AGENT legs
+app.post('/webhooks/room', (req, res) => {
+  res.status(200).end();
+  const run = runs[req.query.sid]; const i = Number(req.query.room);
+  const room = run && run.rooms && run.rooms[i]; const ev = req.body || {};
+  if (!room || !eventSignatureOk(req)) return;
+  if (room.uuid && ev.uuid && ev.uuid !== room.uuid) return; // event for an older park attempt
+  if (ev.status === 'answered') {
+    room.answeredAt = Date.now();
+    const settle = (run.agentSettle || 0) * 1000;
+    addLog(run.id, `agent ${i + 1} - answered${settle ? `, ready in ${settle / 1000}s` : ', ready'}`, 'good');
+    if (room.readyTimer) clearTimeout(room.readyTimer);
+    room.readyTimer = setTimeout(() => { room.readyTimer = null; if (room.state === 'parking' && room.uuid === ev.uuid) { room.state = 'ready'; serveWaiting(run.id); } }, settle);
+    return;
+  }
+  if (TERMINAL_STATES.includes(ev.status)) {
+    if (room.readyTimer) { clearTimeout(room.readyTimer); room.readyTimer = null; }
+    const was = room.state; room.state = 'down'; room.uuid = null;
+    const legId = room.legId; room.legId = null;
+    addLog(run.id, `agent ${i + 1} - left the room (${ev.status}${ev.duration ? ', ' + ev.duration + 's' : ''})`, was === 'busy' ? 'info' : 'warn');
+    if (legId != null && run.legs[legId] && !run.legs[legId].finished) {
+      // the agent hung up first: the room closes, so the customer's leg ends on its own (endOnExit on the agent leg)
+      setTimeout(() => { const l = run.legs[legId]; if (l && !l.finished) api('PUT', 'https://api.nexmo.com/v1/calls/' + l.uuid, { action: 'hangup' }).catch(() => {}); }, 3000);
+    }
+    if (roomStillNeeded(run)) setTimeout(() => parkAgent(run.id, i), 1200); // back in the room for the next human
+    else maybeFinishRun(run.id);
+    return;
+  }
+  if (ev.status) addLog(run.id, `agent ${i + 1} - ${ev.status}`);
+});
 
 // ---------------------------------------------------------------- routes
 app.get('/_/health', (req, res) => res.status(200).send('OK'));
@@ -562,13 +785,32 @@ app.post('/api/call', async (req, res) => {
       // to route / populate the agent screen; requires the Customer Proxy Trunk).
       run.sipHeaders = (b.sipHeaders && typeof b.sipHeaders === 'object' && !Array.isArray(b.sipHeaders)) ? b.sipHeaders : {};
     }
+    // ---- agent room: park the agent(s) first, transfer humans in ----
+    run.detection = b.detection === 'off' ? 'off' : 'amd';
+    run.agentMode = (b.agentMode === 'room' && ['sip', 'forward'].includes(run.humanAction)) ? 'room' : 'per_call';
+    if (run.agentMode === 'room') {
+      run.agents = num(b.agents, 1, 1, 10);                       // parked agent legs per burst - the customer's choice
+      run.agentIds = Array.isArray(b.agentIds) ? b.agentIds.map((x) => String(x)) : (b.agentIds ? String(b.agentIds).split(',').map((s) => s.trim()).filter(Boolean) : []);
+      run.burstId = String(b.burstId || runId).trim().slice(0, 64) || runId;
+      run.busyMessage = String(b.busyMessage || 'Sorry, all our agents are busy right now. We will call you back shortly. Goodbye.').slice(0, 500);
+      run.holdMessage = String(b.holdMessage || 'Please hold, we are connecting you to an agent.').slice(0, 300);
+      run.busyLang = String(b.busyLang || 'en-US').slice(0, 10);
+      run.busyMessageId = b.busyMessageId && messages[b.busyMessageId] ? String(b.busyMessageId) : null;
+      run.busyWait = num(b.busyWait, 0, 0, 60);
+      run.agentSettle = num(b.agentSettle, 0, 0, 30);
+      run.sipHeaders = run.sipHeaders || {};
+      initRooms(run);
+    }
     runs[runId] = run;
     persist(run);
     addLog(runId, `drop run started - ${list.length} number${list.length === 1 ? '' : 's'}, concurrency ${run.concurrency} from ${fromPool.length === 1 ? fromPool[0] : fromPool.length + ' numbers'}, ${msgLabel(run)}`
       + (run.humanAction === 'sip' ? `, humans -> SIP agent` : run.humanAction === 'forward' ? `, humans -> ${run.humanForward}` : ', humans skipped')
+      + (run.agentMode === 'room' ? ` (agent room: ${run.agents} parked agent${run.agents === 1 ? '' : 's'}, burst ${run.burstId})` : '')
+      + (run.detection === 'off' ? ', detection OFF (every answer = human)' : '')
       + (logToSf ? ', logging to Salesforce' : '') + (resultWebhook ? ', pushing results' : ''));
+    if (run.agentMode === 'room') parkAll(runId); // agents first, then the dialler
     launchNext(runId);
-    return res.json({ ok: true, sid: runId, runId, legs: list.length, concurrency: run.concurrency });
+    return res.json({ ok: true, sid: runId, runId, legs: list.length, concurrency: run.concurrency, agentMode: run.agentMode, agents: run.agents || null, burstId: run.burstId || null });
   }
 
   // transfer modes - a single-member run
@@ -715,19 +957,22 @@ app.post('/webhooks/events', async (req, res) => {
   const ev = req.body || {};
   const run = runs[runId];
   const leg = run && run.legs[legId];
-  const status = ev.status, sub = ev.sub_state;
+  let status = ev.status; const sub = ev.sub_state;
 
   if (!eventSignatureOk(req)) { addLog(runId, 'event with BAD signature ignored', 'bad'); return; }
   if (status && !['machine', 'human'].includes(status)) addLog(runId, `leg ${legId + 1} status: ${status}`);
   if (!run || !leg) return;
   if (status === 'answered' && !leg.answeredAt) leg.answeredAt = Date.now();
+  // detection off: no AMD ran, so an answer IS a live human
+  if (status === 'answered' && run.detection === 'off' && !leg.done) status = 'human';
 
   // ANY terminal status frees the leg - a failed/busy/unanswered call never
   // sends 'completed', and treating only 'completed' as terminal stalls a slot.
   const TERMINAL = ['completed', 'failed', 'rejected', 'busy', 'unanswered', 'timeout', 'cancelled'];
   if (TERMINAL.includes(status)) {
-    for (const t of ['dropTimer', 'hangTimer', 'watchdog']) { if (leg[t]) { clearTimeout(leg[t]); leg[t] = null; } }
+    for (const t of ['dropTimer', 'hangTimer', 'watchdog', 'waitTimer']) { if (leg[t]) { clearTimeout(leg[t]); leg[t] = null; } }
     if (!leg.done && status === 'completed') addLog(runId, `leg ${legId + 1} - ended before detection`);
+    releaseRoom(runId, legId); // room mode: the customer left - the parked agent is free again
     finishLeg(runId, legId, leg.outcome || (status === 'completed' ? (leg.done ? 'completed' : 'no_answer') : status));
     return;
   }
@@ -735,6 +980,11 @@ app.post('/webhooks/events', async (req, res) => {
 
   if (status === 'human') {
     leg.done = true;
+    if (run.mode === 'drop' && run.agentMode === 'room') {
+      // HUMAN -> straight into a parked agent's room (agent was dialled first)
+      await roomConnect(runId, legId);
+      return;
+    }
     if (run.mode === 'drop' && run.humanAction === 'sip') {
       // HUMAN -> live agent on a SIP endpoint (e.g. Vonage Contact Center),
       // custom headers carry agent id / CRM record id for the screen pop.
@@ -972,6 +1222,8 @@ async function reconcile() {
         addLog(id, `leg ${Number(legId) + 1} still live (${st}) - awaiting its events`);
       }
     }
+    // room mode: the parked agent legs died with the old process - park again
+    if (r.agentMode === 'room') { initRooms(r); if (roomStillNeeded(r)) parkAll(id); }
     // resume dialling whatever was never claimed
     launchNext(id);
   }
