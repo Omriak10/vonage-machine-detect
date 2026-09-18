@@ -27,7 +27,7 @@ function serialize(run) {
     // agent room settings (rooms themselves are rebuilt + re-parked on resume)
     agentMode: run.agentMode, agents: run.agents, agentIds: run.agentIds, burstId: run.burstId,
     busyMessage: run.busyMessage, holdMessage: run.holdMessage, busyLang: run.busyLang, busyMessageId: run.busyMessageId,
-    busyWait: run.busyWait, agentSettle: run.agentSettle, detection: run.detection,
+    busyWait: run.busyWait, agentSettle: run.agentSettle, detection: run.detection, readyTimeout: run.readyTimeout, repark: run.repark,
     ringTimeout: run.ringTimeout, beepTimeout: run.beepTimeout, agentTimeout: run.agentTimeout, dropDelay: run.dropDelay, minGreeting: run.minGreeting,
     createdAt: run.createdAt,
     // per-leg: keep the call uuid + outcome so a resumed run can reconcile

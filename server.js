@@ -359,7 +359,10 @@ async function placeLeg(runId, legId) {
       // out MUTED. A conversation handles multi-party media, so the transfer
       // bridges with clean audio. The live-listen websocket is joined to the
       // same conversation below as a muted, listen-only participant.
-      { action: 'conversation', name: 'md-' + runId + '-' + legId, endOnExit: true },
+      // Room mode: endOnExit:false - the parked agent leg is TRANSFERRED INTO this
+      // conversation when the human is detected, and must survive the customer
+      // hanging up so the same agent leg can serve the next customer.
+      { action: 'conversation', name: 'md-' + runId + '-' + legId, endOnExit: run.agentMode !== 'room' },
     ],
   });
   if (status >= 300 || !data.uuid) {
@@ -578,12 +581,17 @@ async function parkAgent(runId, i) {
     if (room.attempts < 5) setTimeout(() => { if (roomStillNeeded(run)) parkAgent(runId, i); }, 8000);
     return;
   }
-  room.uuid = data.uuid;
+  if (run.finished || shuttingDown) { // the burst ended while this dial was in flight - don't leave an orphan agent leg
+    api('PUT', 'https://api.nexmo.com/v1/calls/' + data.uuid, { action: 'hangup' }).catch(() => {});
+    room.state = 'down'; return;
+  }
+  room.uuid = data.uuid; room.dialledAt = Date.now();
   const hdr = ep.headers ? ' headers ' + Object.entries(ep.headers).map(([k, v]) => `${k}=${v}`).join(', ') : '';
   addLog(runId, `agent ${i + 1} - dialling ${roomLabel(run)} into room ${room.name} (burst ${run.burstId})${hdr}`);
 }
 function unparkAll(runId) {
   const run = runs[runId]; if (!run || !run.rooms) return;
+  if (run.readyTimer) { clearTimeout(run.readyTimer); run.readyTimer = null; }
   for (const room of run.rooms) {
     if (room.readyTimer) { clearTimeout(room.readyTimer); room.readyTimer = null; }
     if (room.uuid && room.state !== 'busy') {
@@ -623,9 +631,13 @@ async function joinRoom(runId, legId, room) {
   if (leg.waitTimer) { clearTimeout(leg.waitTimer); leg.waitTimer = null; }
   run.waiting = (run.waiting || []).filter((x) => x !== legId);
   const t0 = Date.now();
-  const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
+  // Move the AGENT leg into the CUSTOMER's conversation (never the other way
+  // round): the customer leg is held under machine detection and moving it
+  // gave a bridge with no audio; the parked agent leg is a plain SIP/phone leg
+  // and transfers cleanly - same direction as the per-call mode that works.
+  const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + room.uuid, {
     action: 'transfer',
-    destination: { type: 'ncco', ncco: [{ action: 'conversation', name: room.name, startOnEnter: true, endOnExit: false }] },
+    destination: { type: 'ncco', ncco: [{ action: 'conversation', name: leg.conv, startOnEnter: true, endOnExit: false }] },
   }).catch((e) => ({ status: 0, data: { error: e.message } }));
   if (r.status < 300) {
     leg.outcome = 'human_transferred'; leg.agentUuid = room.uuid;
@@ -678,6 +690,14 @@ async function serveWaiting(runId) {
   addLog(runId, `leg ${legId + 1} - agent ${room.i + 1} freed up after ${Math.round((Date.now() - (leg.waitingSince || Date.now())) / 1000)}s waiting`);
   await joinRoom(runId, legId, room);
 }
+// room mode: the customer calls start only once an agent room is ready (or readyTimeout)
+function startDialing(runId) {
+  const run = runs[runId]; if (!run || run.dialStarted || run.finished) return;
+  run.dialStarted = true;
+  if (run.readyTimer) { clearTimeout(run.readyTimer); run.readyTimer = null; }
+  addLog(runId, 'agent room ready - starting the customer calls');
+  launchNext(runId);
+}
 // events for the PARKED AGENT legs
 app.post('/webhooks/room', (req, res) => {
   res.status(200).end();
@@ -690,7 +710,10 @@ app.post('/webhooks/room', (req, res) => {
     const settle = (run.agentSettle || 0) * 1000;
     addLog(run.id, `agent ${i + 1} - answered${settle ? `, ready in ${settle / 1000}s` : ', ready'}`, 'good');
     if (room.readyTimer) clearTimeout(room.readyTimer);
-    room.readyTimer = setTimeout(() => { room.readyTimer = null; if (room.state === 'parking' && room.uuid === ev.uuid) { room.state = 'ready'; serveWaiting(run.id); } }, settle);
+    room.readyTimer = setTimeout(() => {
+      room.readyTimer = null;
+      if (room.state === 'parking' && room.uuid === ev.uuid) { room.state = 'ready'; addLog(run.id, `agent ${i + 1} - room ready`, 'good'); startDialing(run.id); serveWaiting(run.id); }
+    }, settle);
     return;
   }
   if (TERMINAL_STATES.includes(ev.status)) {
@@ -698,12 +721,30 @@ app.post('/webhooks/room', (req, res) => {
     const was = room.state; room.state = 'down'; room.uuid = null;
     const legId = room.legId; room.legId = null;
     addLog(run.id, `agent ${i + 1} - left the room (${ev.status}${ev.duration ? ', ' + ev.duration + 's' : ''})`, was === 'busy' ? 'info' : 'warn');
-    if (legId != null && run.legs[legId] && !run.legs[legId].finished) {
-      // the agent hung up first: the room closes, so the customer's leg ends on its own (endOnExit on the agent leg)
-      setTimeout(() => { const l = run.legs[legId]; if (l && !l.finished) api('PUT', 'https://api.nexmo.com/v1/calls/' + l.uuid, { action: 'hangup' }).catch(() => {}); }, 3000);
+    const cust = legId != null ? run.legs[legId] : null;
+    if (cust && !cust.finished) {
+      // the agent ended the call: tear the customer side down NOW (no retry of this call)
+      cust.tornDown = true;
+      addLog(run.id, `leg ${legId + 1} - agent hung up, ending the customer call`, 'info');
+      api('PUT', 'https://api.nexmo.com/v1/calls/' + cust.uuid, { action: 'hangup' }).catch(() => {});
     }
-    if (roomStillNeeded(run)) setTimeout(() => parkAgent(run.id, i), 1200); // back in the room for the next human
-    else maybeFinishRun(run.id);
+    // answered-then-dropped within 5 s (VCC rejecting, quota, misroute): count it, and stop re-dialling after 3 in a row
+    const lived = room.dialledAt ? (Date.now() - room.dialledAt) / 1000 : 999;
+    room.quickDrops = (was !== 'busy' && lived < 5) ? (room.quickDrops || 0) + 1 : 0;
+    if (room.quickDrops >= 3) {
+      addLog(run.id, `agent ${i + 1} - dropped within seconds ${room.quickDrops} times in a row; not re-dialling (check the agent endpoint). Remaining humans get the busy message.`, 'bad');
+      maybeFinishRun(run.id); return;
+    }
+    // re-dial the agent only if the customer wants that AND more customers are still to be served
+    const pending = run.nextIdx < run.list.length || (run.waiting || []).length > 0
+      || Object.values(run.legs).some((l) => !l.finished && !l.tornDown && l.room == null);
+    if (run.repark !== false && !run.finished && !shuttingDown && pending) {
+      addLog(run.id, `agent ${i + 1} - ${run.nextIdx < run.list.length ? (run.list.length - run.nextIdx) + ' customers still to call' : 'customers still waiting'}; re-dialling the agent in 2s`);
+      setTimeout(() => parkAgent(run.id, i), 2000);
+    } else {
+      if (!run.finished && pending) addLog(run.id, `agent ${i + 1} - not re-dialled (repark off); remaining humans will get the busy message`, 'warn');
+      maybeFinishRun(run.id);
+    }
     return;
   }
   if (ev.status) addLog(run.id, `agent ${i + 1} - ${ev.status}`);
@@ -797,7 +838,9 @@ app.post('/api/call', async (req, res) => {
       run.busyLang = String(b.busyLang || 'en-US').slice(0, 10);
       run.busyMessageId = b.busyMessageId && messages[b.busyMessageId] ? String(b.busyMessageId) : null;
       run.busyWait = num(b.busyWait, 0, 0, 60);
-      run.agentSettle = num(b.agentSettle, 0, 0, 30);
+      run.agentSettle = num(b.agentSettle != null ? b.agentSettle : b.roomWarmup, 3, 0, 30); // secs after the agent leg answers before the room counts as ready (VCC side settles)
+      run.readyTimeout = num(b.readyTimeout, 30, 0, 120);   // customers are not dialled until a room is ready, or this many secs have passed
+      run.repark = !(b.repark === false || b.repark === 'false' || b.repark === 0); // re-dial the agent after they hang up, if customers are still pending
       run.sipHeaders = run.sipHeaders || {};
       initRooms(run);
     }
@@ -808,8 +851,15 @@ app.post('/api/call', async (req, res) => {
       + (run.agentMode === 'room' ? ` (agent room: ${run.agents} parked agent${run.agents === 1 ? '' : 's'}, burst ${run.burstId})` : '')
       + (run.detection === 'off' ? ', detection OFF (every answer = human)' : '')
       + (logToSf ? ', logging to Salesforce' : '') + (resultWebhook ? ', pushing results' : ''));
-    if (run.agentMode === 'room') parkAll(runId); // agents first, then the dialler
-    launchNext(runId);
+    if (run.agentMode === 'room') {
+      // agents first; the dialler starts when the first room is ready (or after readyTimeout)
+      parkAll(runId);
+      run.dialStarted = false;
+      if (run.readyTimeout > 0) run.readyTimer = setTimeout(() => {
+        if (!run.dialStarted && !run.finished) { addLog(runId, `no agent room ready after ${run.readyTimeout}s - starting the customer calls anyway`, 'warn'); startDialing(runId); }
+      }, run.readyTimeout * 1000);
+      else startDialing(runId);
+    } else launchNext(runId);
     return res.json({ ok: true, sid: runId, runId, legs: list.length, concurrency: run.concurrency, agentMode: run.agentMode, agents: run.agents || null, burstId: run.burstId || null });
   }
 
@@ -1113,7 +1163,17 @@ app.post('/webhooks/events', async (req, res) => {
   }
 });
 
-app.get('/webhooks/answer', (req, res) => res.json([{ action: 'talk', text: 'Vonage machine detect service.', language: 'en-US' }]));
+app.get('/webhooks/answer', (req, res) => {
+  // TEST_ROBOT_NUMBER: a Vonage number linked to this app that answers as a
+  // "robot agent" (loops a spoken line) - lets the agent-room mode be tested
+  // end to end with a real human customer and no contact centre.
+  const robot = clean(process.env.TEST_ROBOT_NUMBER || '18334298762');
+  if (robot && clean(req.query.to) === robot) {
+    return res.json([{ action: 'talk', loop: 0, language: 'en-GB', premium: true,
+      text: 'Hello, this is the parked test agent. If you can hear this, the audio from the agent to the customer is working. I will keep repeating so you can check. ' }]);
+  }
+  res.json([{ action: 'talk', text: 'Vonage machine detect service.', language: 'en-US' }]);
+});
 
 // ------------------------------------------------------------ Salesforce API
 app.get('/api/sf/status', async (req, res) => res.json(await sfdc.status()));

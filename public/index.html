@@ -173,8 +173,13 @@ button:disabled{opacity:.4;cursor:default}
         <div class="row" style="gap:10px">
           <div style="flex:1"><label>Language</label><input id="busyLang" value="en-US"></div>
           <div style="flex:1"><label>Wait for a free agent (s, 0 = none)</label><input id="busyWait" type="number" min="0" max="60" value="0"></div>
-          <div style="flex:1"><label>Agent settle after answer (s)</label><input id="agentSettle" type="number" min="0" max="30" value="0"></div>
+          <div style="flex:1"><label>Agent warm-up after answer (s)</label><input id="agentSettle" type="number" min="0" max="30" value="3"></div>
         </div>
+        <div class="row" style="gap:10px">
+          <div style="flex:1"><label>Max wait for a ready agent before dialling (s)</label><input id="readyTimeout" type="number" min="0" max="120" value="30"></div>
+          <div style="flex:2"><label class="chk" style="margin-top:26px"><input type="checkbox" id="repark" checked> Re-dial the agent after they hang up, while customers are still pending</label></div>
+        </div>
+        <div class="hint">Customers are not dialled until an agent room is ready (agent answered + warm-up). When the agent hangs up, the customer call is ended immediately.</div>
         <label class="chk"><input type="checkbox" id="detOff"> Detection off - treat every answer as a live human (testing / lists you know are live)</label>
       </div>
     </div>
@@ -352,6 +357,8 @@ async function place() {
         body.busyLang = el('busyLang').value || 'en-US';
         body.busyWait = parseInt(el('busyWait').value, 10) || 0;
         body.agentSettle = parseInt(el('agentSettle').value, 10) || 0;
+        body.readyTimeout = parseInt(el('readyTimeout').value, 10) || 0;
+        body.repark = el('repark').checked;
         if (el('detOff').checked) body.detection = 'off';
       }
     }

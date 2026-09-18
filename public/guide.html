@@ -140,7 +140,9 @@
       <tr><td><code>agentIds</code></td><td>Room mode: optional list, one id per parked agent, available as <code>{{agentId}}</code> in <code>sipHeaders</code>.</td></tr>
       <tr><td><code>busyMessage</code> / <code>busyLang</code> / <code>busyMessageId</code></td><td>Room mode: what a human hears when every parked agent is busy (text + TTS language, or an uploaded message id), then we hang up.</td></tr>
       <tr><td><code>busyWait</code></td><td>Room mode: 0 (default) = busy message at once; N = hold the human up to N seconds for an agent to free up.</td></tr>
-      <tr><td><code>agentSettle</code></td><td>Room mode: seconds after the parked leg answers before it counts as ready (lets a VCC queue route to the agent). Default 0.</td></tr>
+      <tr><td><code>agentSettle</code></td><td>Room mode: warm-up seconds after the parked leg answers before it counts as ready (lets the VCC side finish routing). Default 3.</td></tr>
+      <tr><td><code>readyTimeout</code></td><td>Room mode: customers are not dialled until an agent room is ready; if none is ready after this many seconds, dialling starts anyway. Default 30, 0 = don't wait.</td></tr>
+      <tr><td><code>repark</code></td><td>Room mode: <code>true</code> (default) re-dials the agent after they hang up, only while customers are still pending; <code>false</code> never re-dials (remaining humans get the busy message).</td></tr>
       <tr><td><code>detection</code></td><td><code>amd</code> (default) or <code>off</code> = no machine detection, every answer is treated as a live human.</td></tr>
     </table>
   </div></div></div>
@@ -207,8 +209,9 @@
 
   <div class="step"><div class="t"><div class="num">1</div><div>
     <h3>How it works</h3>
-    <p>When the run starts we dial your SIP endpoint (or phone) once per parked agent and hold that leg in a "room". Your VCC routes it to an agent as usual - that queue time is paid <b>once per burst</b>. Customers are then dialled with machine detection as before. Machines get the voicemail and never reach an agent. A <b>human</b> is transferred into a free room straight away (about 0.2 s after detection); the Salesforce activity and your webhook are sent in parallel with the transfer, never before it.</p>
-    <p>When the agent hangs up at the end of a conversation, the room closes, the customer's call ends, and the agent is dialled again for the next human while the burst is still running. When the customer hangs up first, the agent simply stays parked and takes the next human. When the burst is over, the parked legs are released.</p>
+    <p>When the run starts we dial your SIP endpoint (or phone) once per parked agent and hold that leg in a "room". Your VCC routes it to an agent as usual - that queue time is paid <b>once per burst</b>. The customer calls only start once a room is <b>ready</b>: the agent leg has answered and the warm-up (<code>agentSettle</code>, default 3 s) has passed, so the VCC side is fully established before the first customer picks up. Customers are dialled with machine detection as before; machines get the voicemail and never reach an agent.</p>
+    <p>When a <b>human</b> is detected, the parked agent leg is moved into that customer's call (about 0.2 s after detection). The customer's own leg never moves, which is what keeps two-way audio clean. The Salesforce activity and your webhook are sent in parallel with the transfer, never before it.</p>
+    <p>When the customer hangs up, the agent leg stays up and takes the next human. When the <b>agent</b> hangs up, the customer's call is ended immediately and that call is never retried; the agent is dialled again only if customers are still pending in the burst (switch this off with <code>repark: false</code>). When the burst is over, the parked legs are released.</p>
   </div></div></div>
 
   <div class="step"><div class="t"><div class="num">2</div><div>
