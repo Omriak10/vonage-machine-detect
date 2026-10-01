@@ -184,6 +184,37 @@ async function loadDurableDefault() {
 }
 loadDurableDefault(); // fire-and-forget on boot; overrides tmp/bundled once ready
 
+// ------------------------------------------------- comfort audio setting
+// What the caller hears while machine detection runs. Held in durable instance
+// state so the operator can turn it on or off, or swap the sound, from the
+// console WITHOUT a redeploy - and it survives one. A per-call `comfort`
+// parameter still overrides this for that call only.
+const COMFORT_KEY = 'md-comfort-setting';
+let comfortSetting = { enabled: true, sound: 'tone', url: '' }; // on by default
+async function loadComfortSetting() {
+  const s = vcrState(); if (!s) return;
+  try {
+    const raw = await s.get(COMFORT_KEY);
+    if (raw) { comfortSetting = { ...comfortSetting, ...(typeof raw === 'string' ? JSON.parse(raw) : raw) }; console.log('[state] comfort setting loaded:', JSON.stringify(comfortSetting)); }
+  } catch (e) { console.error('[state] load comfort failed:', e.message); }
+}
+async function saveComfortSetting(next) {
+  comfortSetting = { ...comfortSetting, ...next };
+  const s = vcrState(); if (!s) return false;
+  try { await s.set(COMFORT_KEY, JSON.stringify(comfortSetting)); return true; }
+  catch (e) { console.error('[state] save comfort failed:', e.message); return false; }
+}
+// Resolve the setting (or a per-call override) to a playable URL, or null for silence.
+function comfortUrlFor(override) {
+  const pick = override && override !== 'default' ? { enabled: override !== 'off', sound: override, url: '' } : comfortSetting;
+  if (!pick.enabled || pick.sound === 'off') return null;
+  if (pick.sound === 'custom' && pick.url) return pick.url;
+  if (pick.sound === 'tone') return HOST + '/comfort.wav';
+  if (messages[pick.sound]) return HOST + '/message/' + pick.sound + '.wav';
+  return HOST + '/comfort.wav';
+}
+loadComfortSetting();
+
 // ---------------------------------------------- saved call-list registry
 // Reusable named lists (one per campaign / call category), persisted so they
 // survive a restart. A list is [{number, whoId?, name?}]. Sources: paste, CSV
@@ -818,14 +849,12 @@ app.post('/api/call', async (req, res) => {
   // 'auto' (default) = send to a human if the run has anywhere to put one.
   const undetermined = ['auto', 'human', 'machine'].includes(b.undetermined) ? b.undetermined : 'auto';
   // Comfort audio while AMD runs, so the person who just said "allo" hears an open
-  // line instead of dead silence. 'off' (default) | 'tone' (bundled room tone) |
-  // a messageId already uploaded to this instance. comfortUrl overrides all.
-  const comfort = typeof b.comfort === 'string' ? b.comfort.trim() : 'off';
-  const comfortUrl = typeof b.comfortUrl === 'string' && /^https?:\/\//.test(b.comfortUrl) ? b.comfortUrl
-    : comfort === 'off' || !comfort ? null
-    : comfort === 'tone' ? HOST + '/comfort.wav'
-    : messages[comfort] ? HOST + '/message/' + comfort + '.wav'
-    : null;
+  // line instead of dead silence. Defaults to the instance setting (console
+  // controlled); pass comfort:'off'|'tone'|<messageId> to override for this call
+  // only, or comfortUrl for a one-off sound.
+  const comfortUrl = typeof b.comfortUrl === 'string' && /^https?:\/\//.test(b.comfortUrl)
+    ? b.comfortUrl
+    : comfortUrlFor(typeof b.comfort === 'string' ? b.comfort.trim() : null);
 
   const toMember = (x) => (typeof x === 'string'
     ? { number: clean(x) }
@@ -1037,9 +1066,27 @@ app.get('/message/:id.wav', (req, res) => {
   if (!m || !fs.existsSync(m.file)) return res.status(404).end();
   res.set('Content-Type', 'audio/wav').send(fs.readFileSync(m.file));
 });
-// Comfort audio played to the caller while AMD decides (comfort:'tone'). A quiet
-// looping room tone - enough to signal an open line, quiet enough not to talk over
-// the person who just answered.
+// Read or change the comfort-audio setting from the console. No redeploy needed,
+// and it sticks across one.
+app.get('/api/comfort', (req, res) => {
+  res.json({ ...comfortSetting, previewUrl: comfortUrlFor(null), durable: !!vcrState(),
+    choices: [{ id: 'tone', label: 'Built-in room tone' }, ...Object.entries(messages).map(([id, m]) => ({ id, label: 'Recording: ' + (m.name || id) })), { id: 'custom', label: 'Custom audio URL' }] });
+});
+app.post('/api/comfort', express.json(), async (req, res) => {
+  const b = req.body || {};
+  const next = {};
+  if (b.enabled !== undefined) next.enabled = !!b.enabled;
+  if (typeof b.sound === 'string' && b.sound.trim()) next.sound = b.sound.trim();
+  if (typeof b.url === 'string') next.url = /^https?:\/\//.test(b.url) ? b.url.trim() : '';
+  if (next.sound === 'custom' && !(next.url || comfortSetting.url)) return res.status(400).json({ error: 'Custom needs an https audio URL' });
+  const durable = await saveComfortSetting(next);
+  console.log('[comfort] setting is now', JSON.stringify(comfortSetting));
+  res.json({ ok: true, ...comfortSetting, previewUrl: comfortUrlFor(null), durable });
+});
+
+// Comfort audio played to the caller while AMD decides. A quiet looping room tone -
+// enough to signal an open line, quiet enough not to talk over the person who
+// just answered.
 let comfortWav = null;
 app.get('/comfort.wav', (req, res) => {
   if (!comfortWav) {
