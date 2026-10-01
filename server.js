@@ -400,7 +400,10 @@ async function placeLeg(runId, legId) {
       {
         action: 'conversation',
         name: 'md-' + runId + '-' + legId,
-        endOnExit: run.agentMode !== 'room',
+        // endOnExit:true in every mode - when the customer hangs up the conversation
+        // ends, which also drops the agent leg that was transferred in. One agent
+        // leg per customer; no leg left open with nobody on it.
+        endOnExit: true,
         ...(run.comfortUrl ? { musicOnHoldUrl: [run.comfortUrl], startOnEnter: false } : {}),
       },
     ],
@@ -673,6 +676,12 @@ function unparkAll(runId) {
   }
 }
 // the customer leg of a room ended -> that agent is free (unless the agent hung up, which the room webhook handles)
+// ONE AGENT LEG SERVES ONE CUSTOMER.
+// The parked leg used to survive the customer hanging up and go back to 'ready'.
+// That left the agent on an open call with nobody on it, and the next human was
+// transferred onto that same live call with no warning. Now the customer leaving
+// takes the room down and hangs the agent leg up; a human arriving in the gap
+// finds no free room and gets the busy message.
 function releaseRoom(runId, legId) {
   const run = runs[runId]; const leg = run && run.legs[legId]; if (!run || !leg) return;
   if (run.waiting && run.waiting.includes(legId)) { run.waiting = run.waiting.filter((x) => x !== legId); if (!leg.outcome || leg.outcome === 'human_waiting') leg.outcome = 'human_waiting'; }
@@ -680,7 +689,13 @@ function releaseRoom(runId, legId) {
   const room = run.rooms[leg.room];
   if (room && room.legId === legId) {
     room.legId = null;
-    if (room.state === 'busy' && room.uuid) { room.state = 'ready'; addLog(runId, `agent ${room.i + 1} - free again`); serveWaiting(runId); }
+    if (room.state === 'busy' && room.uuid) {
+      const uuid = room.uuid;
+      room.closing = uuid;        // we are ending this leg on purpose - see /webhooks/room
+      room.state = 'down'; room.uuid = null;
+      addLog(runId, `agent ${room.i + 1} - customer call over, releasing the agent leg`);
+      api('PUT', 'https://api.nexmo.com/v1/calls/' + uuid, { action: 'hangup' }).catch(() => {});
+    }
   }
 }
 function busyNcco(run) {
@@ -789,6 +804,18 @@ app.post('/webhooks/room', (req, res) => {
   }
   if (TERMINAL_STATES.includes(ev.status)) {
     if (room.readyTimer) { clearTimeout(room.readyTimer); room.readyTimer = null; }
+    // A leg WE hung up because the customer call finished: that is a normal end,
+    // not the agent dropping out. No quick-drop count, no re-dial from here.
+    if (room.closing && ev.uuid === room.closing) {
+      room.closing = null; room.state = 'down'; room.uuid = null; room.legId = null;
+      addLog(run.id, `agent ${i + 1} - leg closed (${ev.status}${ev.duration ? ', ' + ev.duration + 's' : ''})`);
+      if (run.repark === true && !run.finished && !shuttingDown
+          && (run.nextIdx < run.list.length || (run.waiting || []).length > 0)) {
+        addLog(run.id, `agent ${i + 1} - more customers to call; re-dialling the agent in 2s`);
+        setTimeout(() => parkAgent(run.id, i), 2000);
+      } else maybeFinishRun(run.id);
+      return;
+    }
     const was = room.state; room.state = 'down'; room.uuid = null;
     const legId = room.legId; room.legId = null;
     addLog(run.id, `agent ${i + 1} - left the room (${ev.status}${ev.duration ? ', ' + ev.duration + 's' : ''})`, was === 'busy' ? 'info' : 'warn');
@@ -809,7 +836,7 @@ app.post('/webhooks/room', (req, res) => {
     // re-dial the agent only if the customer wants that AND more customers are still to be served
     const pending = run.nextIdx < run.list.length || (run.waiting || []).length > 0
       || Object.values(run.legs).some((l) => !l.finished && !l.tornDown && l.room == null);
-    if (run.repark !== false && !run.finished && !shuttingDown && pending) {
+    if (run.repark === true && !run.finished && !shuttingDown && pending) {
       addLog(run.id, `agent ${i + 1} - ${run.nextIdx < run.list.length ? (run.list.length - run.nextIdx) + ' customers still to call' : 'customers still waiting'}; re-dialling the agent in 2s`);
       setTimeout(() => parkAgent(run.id, i), 2000);
     } else {
@@ -922,7 +949,10 @@ app.post('/api/call', async (req, res) => {
       run.busyWait = num(b.busyWait, 0, 0, 60);
       run.agentSettle = num(b.agentSettle != null ? b.agentSettle : b.roomWarmup, 3, 0, 30); // secs after the agent leg answers before the room counts as ready (VCC side settles)
       run.readyTimeout = num(b.readyTimeout, 30, 0, 120);   // customers are not dialled until a room is ready, or this many secs have passed
-      run.repark = !(b.repark === false || b.repark === 'false' || b.repark === 0); // re-dial the agent after they hang up, if customers are still pending
+      // One agent leg per customer, so by DEFAULT the agent is not dialled again
+      // after a customer call ends - later humans get the busy message. Set
+      // repark:true to keep re-dialling the agent while customers are pending.
+      run.repark = (b.repark === true || b.repark === 'true' || b.repark === 1 || b.repark === '1');
       run.sipHeaders = run.sipHeaders || {};
       initRooms(run);
     }
