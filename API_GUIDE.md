@@ -121,6 +121,22 @@ curl -X POST "$BASE/api/call" -H "Content-Type: application/json" -d '{
 | `beepTimeout` | no | Seconds to wait for the voicemail beep before leaving a message (default 45, range 30-120). |
 | `agentTimeout` | no | Seconds to ring the agent / forward number on a transfer before giving up (default 45, range 5-120). |
 | `logToSf` | no | *(Optional, off by default.)* `true` to also write each outcome to Salesforce. Leave off to use the JSON webhook only. |
+| `undetermined` | no | What to do when machine detection reaches **no verdict** and only its timer fires. `auto` (default) sends the call to a human whenever the run has somewhere to put one; `human` always does; `machine` keeps the old behaviour of treating it as an answering machine. See below. |
+| `comfort` | no | Audio the caller hears **while detection runs**, instead of silence. `off` (default), `tone` (a quiet built-in room tone), or the id of a message you uploaded. `comfortUrl` takes a full HTTPS URL instead. |
+
+**Undetermined detection.** Machine detection normally returns a verdict in 3-8
+seconds. If it returns nothing at all, its beep timer eventually fires and the
+platform reports a machine with sub-state `beep_timeout`. That is a timeout, not a
+decision, and it looks identical when a real person answered and simply never
+produced a voicemail beep. Treating it as a machine means playing a recording at a
+live person, so by default those calls now go to an agent instead and a
+`amd_undetermined` event is sent. Set `undetermined: "machine"` to restore the
+previous behaviour.
+
+**Comfort audio.** During detection the caller is held on an open but silent line
+for a few seconds, which can feel like a dead call. Set `comfort` and they hear a
+quiet tone instead, which stops the moment the agent is connected. It is off by
+default, so nothing changes unless you ask for it.
 
 **Response:** `{ "ok": true, "sid": "<runId>", "runId": "<runId>", "legs": <count>, "concurrency": <n> }`
 

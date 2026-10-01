@@ -362,7 +362,16 @@ async function placeLeg(runId, legId) {
       // Room mode: endOnExit:false - the parked agent leg is TRANSFERRED INTO this
       // conversation when the human is detected, and must survive the customer
       // hanging up so the same agent leg can serve the next customer.
-      { action: 'conversation', name: 'md-' + runId + '-' + legId, endOnExit: run.agentMode !== 'room' },
+      // Comfort audio (optional): with musicOnHoldUrl + startOnEnter:false the
+      // caller hears an open line instead of silence while AMD decides. It stops
+      // the instant the agent leg joins and the conversation starts. Without it
+      // the behaviour is exactly as before: a silent conversation.
+      {
+        action: 'conversation',
+        name: 'md-' + runId + '-' + legId,
+        endOnExit: run.agentMode !== 'room',
+        ...(run.comfortUrl ? { musicOnHoldUrl: [run.comfortUrl], startOnEnter: false } : {}),
+      },
     ],
   });
   if (status >= 300 || !data.uuid) {
@@ -558,9 +567,40 @@ function roomEndpoint(run, i) {
   return { type: 'phone', number: run.humanForward };
 }
 function roomLabel(run) { return run.humanAction === 'sip' ? run.sipUri : run.humanForward; }
+// Where should an UNDETERMINED AMD result go? 'auto' (default) sends it to a human
+// whenever the run actually has somewhere to put one, because playing a voicemail
+// recording at a real person is the worse error. Override per call with
+// undetermined:'human' | 'machine'.
+function undeterminedGoesToHuman(run) {
+  if (!run) return false;
+  if (run.undetermined === 'machine') return false;
+  if (run.undetermined === 'human') return true;
+  return run.agentMode === 'room' || ['forward', 'sip'].includes(run.humanAction) || run.mode !== 'drop';
+}
+// Can this leg still turn into a live person who needs an agent? A leg already
+// classified as a machine cannot - it is only playing out a voicemail message.
+function legMayNeedAgent(l) {
+  if (!l || l.finished) return false;
+  if (l.machineNotified) return false;
+  return !String(l.outcome || '').startsWith('machine');
+}
 function roomStillNeeded(run) {
   return !run.finished && !shuttingDown && (run.nextIdx < run.list.length
-    || Object.values(run.legs).some((l) => !l.finished) || (run.waiting || []).length > 0);
+    || Object.values(run.legs).some(legMayNeedAgent) || (run.waiting || []).length > 0);
+}
+// David: when every remaining call in the burst has turned out to be a machine,
+// let the parked agent go straight away and report it, instead of holding the
+// agent leg open until the last voicemail message has finished playing.
+function maybeReleaseAgents(runId) {
+  const run = runs[runId];
+  if (!run || !run.rooms || run.agentsReleased || run.finished) return;
+  if (roomStillNeeded(run)) return;
+  run.agentsReleased = true;
+  const left = Object.values(run.legs).filter((l) => !l.finished).length;
+  addLog(runId, `every remaining call is an answering machine - releasing the parked agent(s) now`
+    + (left ? ` (${left} message${left > 1 ? 's' : ''} still playing out)` : ''), 'good');
+  pushEvent(run, null, 'agents_released', { reason: 'all_machines', messagesStillPlaying: left });
+  unparkAll(runId);
 }
 function parkAll(runId) { const run = runs[runId]; if (!run || !run.rooms) return; run.rooms.forEach((r, i) => setTimeout(() => parkAgent(runId, i), 200 * i)); }
 async function parkAgent(runId, i) {
@@ -774,6 +814,18 @@ app.post('/api/call', async (req, res) => {
   const agentTimeout = num(b.agentTimeout, 45, 5, 120); // ring the agent/forward this long on transfer, then give up
   const dropDelay = num(b.dropDelay, 7, 2, 45);         // drop mode: play the voicemail message this many seconds AFTER answer (past greeting + tone); tunable per call
   const minGreeting = num(b.minGreeting, 3, 0, 20);     // drop mode: ignore any "beep" within this many secs of answer (false-beep guard)
+  // What to do when AMD reaches no verdict and only the beep timer fires.
+  // 'auto' (default) = send to a human if the run has anywhere to put one.
+  const undetermined = ['auto', 'human', 'machine'].includes(b.undetermined) ? b.undetermined : 'auto';
+  // Comfort audio while AMD runs, so the person who just said "allo" hears an open
+  // line instead of dead silence. 'off' (default) | 'tone' (bundled room tone) |
+  // a messageId already uploaded to this instance. comfortUrl overrides all.
+  const comfort = typeof b.comfort === 'string' ? b.comfort.trim() : 'off';
+  const comfortUrl = typeof b.comfortUrl === 'string' && /^https?:\/\//.test(b.comfortUrl) ? b.comfortUrl
+    : comfort === 'off' || !comfort ? null
+    : comfort === 'tone' ? HOST + '/comfort.wav'
+    : messages[comfort] ? HOST + '/message/' + comfort + '.wav'
+    : null;
 
   const toMember = (x) => (typeof x === 'string'
     ? { number: clean(x) }
@@ -782,6 +834,7 @@ app.post('/api/call', async (req, res) => {
   const run = {
     id: runId, mode, from, fromPool, logToSf, resultWebhook,
     ringTimeout, beepTimeout, agentTimeout, dropDelay, minGreeting,
+    undetermined, comfortUrl,
     legs: {}, nextIdx: 0, active: 0, counts: {}, finished: false,
     createdAt: Date.now(),
   };
@@ -984,6 +1037,18 @@ app.get('/message/:id.wav', (req, res) => {
   if (!m || !fs.existsSync(m.file)) return res.status(404).end();
   res.set('Content-Type', 'audio/wav').send(fs.readFileSync(m.file));
 });
+// Comfort audio played to the caller while AMD decides (comfort:'tone'). A quiet
+// looping room tone - enough to signal an open line, quiet enough not to talk over
+// the person who just answered.
+let comfortWav = null;
+app.get('/comfort.wav', (req, res) => {
+  if (!comfortWav) {
+    const p = path.join(__dirname, 'assets', 'comfort.wav');
+    if (fs.existsSync(p)) comfortWav = fs.readFileSync(p);
+  }
+  if (!comfortWav) return res.status(404).end();
+  res.set('Content-Type', 'audio/wav').set('Cache-Control', 'public, max-age=3600').send(comfortWav);
+});
 
 // ------------------------------------------------------- event webhook
 // Optional spoofing protection: set VONAGE_SIGNATURE_SECRET (your application's
@@ -1082,6 +1147,24 @@ app.post('/webhooks/events', async (req, res) => {
     return;
   }
 
+  // ------------------------------------------------------------------
+  // 'machine' with sub_state 'beep_timeout' is NOT an acoustic verdict. It is
+  // Vonage's beep timer expiring having classified nothing, and it fires just the
+  // same when a live person answered and simply never produced a voicemail beep.
+  // Seen in production 2026-09-30 11:27-12:15Z: for ~45 minutes EVERY call came
+  // back 'machine (beep_timeout)' at exactly 29.5-30.0s after answer, with not one
+  // acoustic human/machine among them, so real people were played a voicemail
+  // recording. Healthy calls classify in 3-8s.
+  // Treat it as UNDETERMINED: if the run has somewhere to put a human, send them
+  // there. A rare false-human is acceptable (customer's own words); a real person
+  // being talked at by a recording is not.
+  if (status === 'machine' && sub === 'beep_timeout' && undeterminedGoesToHuman(run)) {
+    leg.amdUndetermined = true;
+    addLog(runId, `leg ${legId + 1} - NO AMD verdict after ${run.beepTimeout || 30}s (beep_timeout), not a real machine signal - treating as HUMAN`, 'warn');
+    pushEvent(run, legId, 'amd_undetermined', { answeredBy: 'unknown', action: 'treated_as_human' });
+    status = 'human';
+  }
+
   if (status === 'machine') {
     addLog(runId, `leg ${legId + 1} MACHINE detected` + (sub ? ` (${sub})` : ''), 'warn');
     // (A) notify the CRM the MOMENT a machine is detected - once, and separate
@@ -1090,6 +1173,9 @@ app.post('/webhooks/events', async (req, res) => {
       leg.machineNotified = true;
       logSf(runId, legId, 'machine_detected', 'Answering machine detected.');
       pushDetection(run, legId);
+      // this leg can never need an agent now - if it was the last undecided one,
+      // free the parked agent immediately rather than at end-of-message
+      maybeReleaseAgents(runId);
     }
     if (run.mode === 'drop') {
       if (leg.transferred || leg.dropTimer) return; // already handling this leg

@@ -13,3 +13,10 @@ npm-debug.log*
 # runtime
 *.wav
 drop-message.wav
+
+# the synthetic comfort tone IS part of the app (no customer audio in it)
+!assets/comfort.wav
+
+# local scratch / diagnostics, not part of the app
+_*.js
+_*.json
