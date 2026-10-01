@@ -1,4 +1,4 @@
-# secrets & deployment-specific config - never commit
+﻿# secrets & deployment-specific config - never commit
 .env
 vcr.yml
 private.key
@@ -20,3 +20,7 @@ drop-message.wav
 # local scratch / diagnostics, not part of the app
 _*.js
 _*.json
+_*.png
+_*.txt
+
+
