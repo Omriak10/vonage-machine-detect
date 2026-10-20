@@ -182,7 +182,55 @@ async function loadDurableDefault() {
     if (b64) { dropMessage = Buffer.from(b64, 'base64'); console.log('[state] loaded durable default announcement (' + dropMessage.length + ' bytes)'); }
   } catch (e) { console.error('[state] load default failed:', e.message); }
 }
-loadDurableDefault(); // fire-and-forget on boot; overrides tmp/bundled once ready
+// ---- chunked durable blobs (20 Oct 2026). A single state value is size-capped: a 419 KB default
+// announcement was rejected with HTTP 413 and lived only in tmp, so a redeploy deleted it. Blobs are now
+// split into ~48 KB base64 chunks (key:0..n-1) with the count written LAST, so a half-written blob is
+// never read back. Used for the default announcement AND every named message.
+const BLOB_CHUNK = 48000; // a single state value is capped near 64 KB: 60 KB passed, 180 KB gave 413
+async function saveBlob(key, buf) {
+  const st = vcrState(); if (!st) return false;
+  try {
+    const b64 = buf.toString('base64'); const n = Math.ceil(b64.length / BLOB_CHUNK);
+    for (let i = 0; i < n; i++) await st.set(key + ':' + i, b64.slice(i * BLOB_CHUNK, (i + 1) * BLOB_CHUNK));
+    await st.set(key + ':n', String(n));
+    return true;
+  } catch (e) { console.error('[state] saveBlob', key, e.message); return false; }
+}
+async function loadBlob(key) {
+  const st = vcrState(); if (!st) return null;
+  try {
+    const n = parseInt(await st.get(key + ':n'), 10); if (!n) return null;
+    const parts = []; for (let i = 0; i < n; i++) { const c = await st.get(key + ':' + i); if (typeof c !== 'string') return null; parts.push(c); }
+    return Buffer.from(parts.join(''), 'base64');
+  } catch (e) { console.error('[state] loadBlob', key, e.message); return null; }
+}
+async function deleteBlob(key) {
+  const st = vcrState(); if (!st) return;
+  try { const n = parseInt(await st.get(key + ':n'), 10) || 0; await st.delete(key + ':n'); for (let i = 0; i < n; i++) await st.delete(key + ':' + i); } catch (e) {}
+}
+const DEFAULT_BLOB = 'md-default-wav', MSG_INDEX_KEY = 'md-msg-index';
+async function saveMsgIndexDurable() {
+  const st = vcrState(); if (!st) return;
+  const idx = {}; for (const [id, m] of Object.entries(messages)) idx[id] = { name: m.name, bytes: m.bytes };
+  try { await st.set(MSG_INDEX_KEY, JSON.stringify(idx)); } catch (e) { console.error('[state] save msg index', e.message); }
+}
+async function loadDurableMessages() {
+  const st = vcrState(); if (!st) return;
+  try {
+    const def = await loadBlob(DEFAULT_BLOB);
+    if (def) { dropMessage = def; try { fs.writeFileSync(MSG_PATH, def); } catch {} console.log('[state] restored default announcement (' + def.length + ' bytes, chunked)'); }
+    const raw = await st.get(MSG_INDEX_KEY); const idx = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : {};
+    let n = 0;
+    for (const [id, m] of Object.entries(idx)) {
+      if (messages[id]) continue;
+      const buf = await loadBlob('md-msg-' + id); if (!buf) continue;
+      const file = path.join(MSG_DIR, `md-msg-${id}.wav`); try { fs.writeFileSync(file, buf); } catch { continue; }
+      messages[id] = { name: m.name, bytes: buf.length, file }; n++;
+    }
+    if (n) { saveMsgIndex(); console.log('[state] restored ' + n + ' named message(s) from durable storage'); }
+  } catch (e) { console.error('[state] restore messages failed', e.message); }
+}
+loadDurableDefault().then(loadDurableMessages); // boot: old single-key default first, then chunked blobs override
 
 // ------------------------------------------------- comfort audio setting
 // What the caller hears while machine detection runs. Held in durable instance
@@ -209,9 +257,11 @@ function comfortUrlFor(override) {
   const pick = override && override !== 'default' ? { enabled: override !== 'off', sound: override, url: '' } : comfortSetting;
   if (!pick.enabled || pick.sound === 'off') return null;
   if (pick.sound === 'custom' && pick.url) return pick.url;
-  if (pick.sound === 'tone') return HOST + '/comfort.wav';
-  if (messages[pick.sound]) return HOST + '/message/' + pick.sound + '.wav';
-  return HOST + '/comfort.wav';
+  // musicOnHoldUrl only plays MP3 (Vonage NCCO reference: "A URL to the mp3 file"),
+  // so the hold sound is served as an MP3 rendition of the WAV. A WAV here is silent.
+  if (pick.sound === 'tone') return HOST + '/comfort.mp3';
+  if (messages[pick.sound]) return HOST + '/comfort/' + pick.sound + '.mp3';
+  return HOST + '/comfort.mp3';
 }
 loadComfortSetting();
 
@@ -533,6 +583,7 @@ function pushEvent(run, legId, event, extra) {
     runId: run.id, burstId: run.burstId || run.id, legId, callUuid: leg.uuid, mode: run.mode,
     number: leg.m.number, name: leg.m.name || null, whoId: leg.m.whoId || null,
     from: leg.from || run.from,
+    detectionMs: leg.detectionMs == null ? null : leg.detectionMs,
     at: new Date().toISOString(),
   }, extra || {}), run.id, event);
 }
@@ -559,6 +610,7 @@ function pushResult(run, legId, outcome, detail) {
       voicemailMessageId: outcome === 'machine_message_dropped' ? (run.messageId || 'default') : null,
       outcome,                                  // full internal status, for reference
       detail: detail || null,
+      detectionMs: leg.detectionMs == null ? null : leg.detectionMs, // answer -> AMD verdict
       timeouts: { ringSec: run.ringTimeout, beepSec: run.beepTimeout, agentSec: run.agentTimeout },
       at: new Date().toISOString(),
     };
@@ -1019,6 +1071,8 @@ app.post('/api/message', express.raw({ type: '*/*', limit: '15mb' }), (req, res)
     messages[id] = { name, bytes: audio.length, file };
     saveMsgIndex();
     addLog('msg', `named message "${name}" saved (${Math.round(audio.length / 1024)} KB) - id ${id}`, 'good');
+    saveBlob('md-msg-' + id, audio).then((ok) => saveMsgIndexDurable().then(() =>
+      addLog('msg', ok ? `named message "${name}" stored durably - it survives redeploys` : `note: "${name}" kept in tmp only (durable store failed)`, ok ? 'good' : 'warn')));
     return res.json({ ok: true, id, name, bytes: audio.length });
   }
   dropMessage = audio;
@@ -1026,7 +1080,7 @@ app.post('/api/message', express.raw({ type: '*/*', limit: '15mb' }), (req, res)
   addLog('msg', `default message saved (${Math.round(dropMessage.length / 1024)} KB)`, 'good');
   // persist durably so it survives a restart / redeploy (customer self-serve).
   // Free-plan KV quota is 1 MB; base64 of a short (<~20s) WAV fits comfortably.
-  saveDurableDefault(dropMessage).then((ok) => {
+  saveBlob(DEFAULT_BLOB, dropMessage).then((ok) => {
     if (ok) addLog('msg', 'default announcement stored durably - it will survive restarts and redeploys', 'good');
     else addLog('msg', 'note: durable store unavailable, default kept in tmp only (lost on redeploy)', 'warn');
   });
@@ -1074,14 +1128,15 @@ app.delete('/api/message/:id', (req, res) => {
   const m = messages[req.params.id];
   if (!m) return res.status(404).json({ error: 'unknown message id' });
   try { fs.existsSync(m.file) && fs.unlinkSync(m.file); } catch {}
+  deleteBlob('md-msg-' + req.params.id);
   delete messages[req.params.id];
-  saveMsgIndex();
+  saveMsgIndex(); saveMsgIndexDurable();
   addLog('msg', `named message "${m.name}" deleted`);
   res.json({ ok: true });
 });
 app.delete('/api/message', (req, res) => {
   try { fs.existsSync(MSG_PATH) && fs.unlinkSync(MSG_PATH); } catch {}
-  deleteDurableDefault();
+  deleteDurableDefault(); deleteBlob(DEFAULT_BLOB);
   // fall back to the bundled announcement if one ships with the app, else TTS
   dropMessage = fs.existsSync(BUNDLED_MSG) ? fs.readFileSync(BUNDLED_MSG) : null;
   addLog('msg', dropMessage ? 'reverted to the bundled default announcement' : 'reverted to automatic message', 'info');
@@ -1117,6 +1172,46 @@ app.post('/api/comfort', express.json(), async (req, res) => {
 // Comfort audio played to the caller while AMD decides. A quiet looping room tone -
 // enough to signal an open line, quiet enough not to talk over the person who
 // just answered.
+// ---- MP3 renditions for hold audio. 16-bit PCM WAV -> MP3 with lamejs (pure JS, no ffmpeg on VCR).
+let lameMod = null;
+async function wavToMp3(buf) {
+  if (!lameMod) lameMod = await import('@breezystack/lamejs');
+  if (!buf || buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF') throw new Error('not a WAV');
+  let off = 12, fmt = null, data = null;
+  while (off + 8 <= buf.length) {
+    const id = buf.toString('ascii', off, off + 4), size = buf.readUInt32LE(off + 4);
+    if (id === 'fmt ') fmt = { ch: buf.readUInt16LE(off + 10), rate: buf.readUInt32LE(off + 12), bits: buf.readUInt16LE(off + 22) };
+    if (id === 'data') { data = buf.subarray(off + 8, Math.min(buf.length, off + 8 + size)); break; }
+    off += 8 + size + (size % 2);
+  }
+  if (!fmt || !data || fmt.bits !== 16) throw new Error('need 16-bit PCM WAV');
+  const ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.length - (data.length % 2));
+  let pcm = new Int16Array(ab);
+  if (fmt.ch === 2) { const m = new Int16Array(pcm.length / 2); for (let i = 0; i < m.length; i++) m[i] = (pcm[2 * i] + pcm[2 * i + 1]) >> 1; pcm = m; }
+  const enc = new lameMod.Mp3Encoder(1, fmt.rate, 48); const out = [];
+  for (let i = 0; i < pcm.length; i += 1152) { const c = enc.encodeBuffer(pcm.subarray(i, i + 1152)); if (c.length) out.push(Buffer.from(c)); }
+  const f = enc.flush(); if (f.length) out.push(Buffer.from(f));
+  return Buffer.concat(out);
+}
+const comfortMp3 = new Map(); // key -> { src: Buffer (the WAV it was made from), mp3: Buffer }
+async function mp3For(key, wav, res) {
+  if (!wav) return res.status(404).end();
+  try {
+    let hit = comfortMp3.get(key);
+    if (!hit) { hit = { mp3: await wavToMp3(wav) }; comfortMp3.set(key, hit); }
+    res.set('Content-Type', 'audio/mpeg').set('Cache-Control', 'no-cache').send(hit.mp3);
+  } catch (e) { console.error('[comfort] mp3 failed', key, e.message); res.status(500).end(); }
+}
+app.get('/comfort.mp3', (req, res) => {
+  if (!comfortWav) { const p = path.join(__dirname, 'assets', 'comfort.wav'); if (fs.existsSync(p)) comfortWav = fs.readFileSync(p); }
+  return mp3For('tone', comfortWav, res);
+});
+app.get('/comfort/:id.mp3', (req, res) => {
+  const m = messages[req.params.id];
+  const wav = m && m.file && fs.existsSync(m.file) ? fs.readFileSync(m.file) : null;
+  return mp3For('msg:' + req.params.id + ':' + (m ? m.bytes : 0), wav, res);
+});
+
 let comfortWav = null;
 app.get('/comfort.wav', (req, res) => {
   if (!comfortWav) {
@@ -1170,6 +1265,12 @@ app.post('/webhooks/events', async (req, res) => {
   }
   if (leg.done) return;
 
+  // Detection time = answer -> AMD verdict, in ms (David: for their stats).
+  if ((status === 'human' || status === 'machine') && leg.detectionMs == null && leg.answeredAt) {
+    leg.detectionMs = Date.now() - leg.answeredAt;
+    addLog(runId, `leg ${legId + 1} - AMD verdict "${status}${sub ? ' (' + sub + ')' : ''}" after ${leg.detectionMs} ms`);
+  }
+
   if (status === 'human') {
     leg.done = true;
     if (run.mode === 'drop' && run.agentMode === 'room') {
@@ -1182,6 +1283,7 @@ app.post('/webhooks/events', async (req, res) => {
       // custom headers carry agent id / CRM record id for the screen pop.
       const headers = {};
       for (const [k, v] of Object.entries(run.sipHeaders || {})) headers[k] = tmpl(v, run, legId, leg.m);
+      if (leg.detectionMs != null) headers['X-Detection-Ms'] = String(leg.detectionMs);
       addLog(runId, `HUMAN detected - connecting SIP agent (${run.sipUri}) into the call`, 'good');
       const r = await bridgeIntoConversation(run, leg, { type: 'sip', uri: run.sipUri, headers });
       if (r.status < 300) {
