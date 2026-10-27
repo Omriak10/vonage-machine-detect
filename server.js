@@ -419,12 +419,14 @@ async function placeLeg(runId, legId) {
   // Always use `detect` (not `detect_beep`): Vonage's beep event fires falsely
   // during real voicemail greetings, so we time the message drop from ANSWER
   // instead of the beep. `detect` is also more accurate at spotting live humans.
+  // mode 'default' = asynchronous: Vonage runs the NCCO during detection, so the held
+  // conversation (and its comfort sound) starts at ANSWER. 'detect' = synchronous: the NCCO
+  // only starts after the verdict, which left the comfort sound a ~0.1 s window (David, 26 Oct).
   const amd = {
     behavior: 'continue',
-    mode: 'detect',
+    mode: run.amdMode === 'detect' ? 'detect' : 'default',
     beep_timeout: run.beepTimeout || 30,
   };
-  run.amdMode = amd.mode;
   const { status, data } = await api('POST', 'https://api.nexmo.com/v1/calls', {
     to: [{ type: 'phone', number: m.number }],
     from: { type: 'phone', number: fromNum },
@@ -454,7 +456,8 @@ async function placeLeg(runId, legId) {
         // ends, which also drops the agent leg that was transferred in. One agent
         // leg per customer; no leg left open with nobody on it.
         endOnExit: true,
-        ...(run.comfortUrl ? { musicOnHoldUrl: [run.comfortUrl], startOnEnter: false } : {}),
+        ...(run.comfortUrl && run.comfortVia !== 'stream' ? { musicOnHoldUrl: [run.comfortUrl], startOnEnter: false } : {}),
+        ...(run.comfortUrl && run.comfortVia === 'stream' ? { startOnEnter: false } : {}),
       },
     ],
   });
@@ -584,6 +587,7 @@ function pushEvent(run, legId, event, extra) {
     number: leg.m.number, name: leg.m.name || null, whoId: leg.m.whoId || null,
     from: leg.from || run.from,
     detectionMs: leg.detectionMs == null ? null : leg.detectionMs,
+    startedAt: leg.startedAtIso || null, answeredAt: leg.answeredAtIso || null, detectionEndedAt: leg.detectionEndedAtIso || null, amdMode: run.amdMode,
     at: new Date().toISOString(),
   }, extra || {}), run.id, event);
 }
@@ -611,6 +615,7 @@ function pushResult(run, legId, outcome, detail) {
       outcome,                                  // full internal status, for reference
       detail: detail || null,
       detectionMs: leg.detectionMs == null ? null : leg.detectionMs, // answer -> AMD verdict
+      startedAt: leg.startedAtIso || null, answeredAt: leg.answeredAtIso || null, detectionEndedAt: leg.detectionEndedAtIso || null, amdMode: run.amdMode,
       timeouts: { ringSec: run.ringTimeout, beepSec: run.beepTimeout, agentSec: run.agentTimeout },
       at: new Date().toISOString(),
     };
@@ -943,6 +948,8 @@ app.post('/api/call', async (req, res) => {
     id: runId, mode, from, fromPool, logToSf, resultWebhook,
     ringTimeout, beepTimeout, agentTimeout, dropDelay, minGreeting,
     undetermined, comfortUrl,
+    amdMode: b.amdMode === 'detect' ? 'detect' : 'default',
+    comfortVia: b.comfortVia === 'stream' ? 'stream' : 'hold',
     legs: {}, nextIdx: 0, active: 0, counts: {}, finished: false,
     createdAt: Date.now(),
   };
@@ -1014,6 +1021,7 @@ app.post('/api/call', async (req, res) => {
       + (run.humanAction === 'sip' ? `, humans -> SIP agent` : run.humanAction === 'forward' ? `, humans -> ${run.humanForward}` : ', humans skipped')
       + (run.agentMode === 'room' ? ` (agent room: ${run.agents} parked agent${run.agents === 1 ? '' : 's'}, burst ${run.burstId})` : '')
       + (run.detection === 'off' ? ', detection OFF (every answer = human)' : '')
+      + `, AMD mode ${run.amdMode}, comfort ${run.comfortUrl ? run.comfortUrl + ' via ' + run.comfortVia : 'off'}`
       + (logToSf ? ', logging to Salesforce' : '') + (resultWebhook ? ', pushing results' : ''));
     if (run.agentMode === 'room') {
       // agents first; the dialler starts when the first room is ready (or after readyTimeout)
@@ -1188,10 +1196,19 @@ async function wavToMp3(buf) {
   const ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.length - (data.length % 2));
   let pcm = new Int16Array(ab);
   if (fmt.ch === 2) { const m = new Int16Array(pcm.length / 2); for (let i = 0; i < m.length; i++) m[i] = (pcm[2 * i] + pcm[2 * i + 1]) >> 1; pcm = m; }
-  const enc = new lameMod.Mp3Encoder(1, fmt.rate, 48); const out = [];
+  // Vonage's prerecorded-audio guidance expects a standard MP3 with an ID3 header. A 16 kHz
+  // source encodes as MPEG-2, so upsample to 32 kHz (MPEG-1 Layer III) and prepend an ID3v2 tag.
+  let rate = fmt.rate;
+  if (rate < 32000) {
+    const k = 32000 / rate, up = new Int16Array(Math.floor(pcm.length * k));
+    for (let i = 0; i < up.length; i++) { const x = i / k, j = Math.floor(x), f = x - j; const a = pcm[j] || 0, b = pcm[Math.min(j + 1, pcm.length - 1)] || 0; up[i] = Math.round(a + (b - a) * f); }
+    pcm = up; rate = 32000;
+  }
+  const enc = new lameMod.Mp3Encoder(1, rate, 64); const out = [];
   for (let i = 0; i < pcm.length; i += 1152) { const c = enc.encodeBuffer(pcm.subarray(i, i + 1152)); if (c.length) out.push(Buffer.from(c)); }
   const f = enc.flush(); if (f.length) out.push(Buffer.from(f));
-  return Buffer.concat(out);
+  const id3 = Buffer.concat([Buffer.from('ID3'), Buffer.from([3, 0, 0, 0, 0, 0, 10]), Buffer.alloc(10)]); // ID3v2.3, 10 bytes padding
+  return Buffer.concat([id3, ...out]);
 }
 const comfortMp3 = new Map(); // key -> { src: Buffer (the WAV it was made from), mp3: Buffer }
 async function mp3For(key, wav, res) {
@@ -1203,10 +1220,12 @@ async function mp3For(key, wav, res) {
   } catch (e) { console.error('[comfort] mp3 failed', key, e.message); res.status(500).end(); }
 }
 app.get('/comfort.mp3', (req, res) => {
+  addLog('comfort', `GET /comfort.mp3 from ${req.ip || '?'} (${String(req.get('user-agent') || '-').slice(0, 60)})`);
   if (!comfortWav) { const p = path.join(__dirname, 'assets', 'comfort.wav'); if (fs.existsSync(p)) comfortWav = fs.readFileSync(p); }
   return mp3For('tone', comfortWav, res);
 });
 app.get('/comfort/:id.mp3', (req, res) => {
+  addLog('comfort', `GET /comfort/${req.params.id}.mp3 from ${req.ip || '?'} (${String(req.get('user-agent') || '-').slice(0, 60)})`);
   const m = messages[req.params.id];
   const wav = m && m.file && fs.existsSync(m.file) ? fs.readFileSync(m.file) : null;
   return mp3For('msg:' + req.params.id + ':' + (m ? m.bytes : 0), wav, res);
@@ -1248,8 +1267,18 @@ app.post('/webhooks/events', async (req, res) => {
 
   if (!eventSignatureOk(req)) { addLog(runId, 'event with BAD signature ignored', 'bad'); return; }
   if (status && !['machine', 'human'].includes(status)) addLog(runId, `leg ${legId + 1} status: ${status}`);
+  if (['machine', 'human'].includes(status)) addLog(runId, `leg ${legId + 1} AMD raw event: ${JSON.stringify({ status: ev.status, sub_state: ev.sub_state, type: ev.type, timestamp: ev.timestamp, detail: ev.detail, reason: ev.reason }).slice(0, 300)}`);
   if (!run || !leg) return;
-  if (status === 'answered' && !leg.answeredAt) leg.answeredAt = Date.now();
+  const evIso = (() => { const t = Date.parse(ev.timestamp || ''); return new Date(isNaN(t) ? Date.now() : t).toISOString(); })();
+  if (status === 'started' && !leg.startedAtIso) leg.startedAtIso = evIso;
+  if (status === 'answered' && !leg.answeredAt) { leg.answeredAt = Date.now(); leg.answeredAtIso = evIso; }
+  // comfortVia 'stream': play the comfort sound into the leg from ANSWER with the REST stream API,
+  // looping, while AMD (any mode) decides. Stopped at the verdict, before any transfer.
+  if (status === 'answered' && run && leg && run.comfortUrl && run.comfortVia === 'stream' && !leg.comfortStreaming) {
+    leg.comfortStreaming = true;
+    api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid + '/stream', { stream_url: [run.comfortUrl], loop: 0 })
+      .then((r) => addLog(runId, `leg ${legId + 1} - comfort stream started (${r.status})`)).catch((e) => addLog(runId, `leg ${legId + 1} - comfort stream failed: ${e.message}`, 'warn'));
+  }
   // detection off: no AMD ran, so an answer IS a live human
   if (status === 'answered' && run.detection === 'off' && !leg.done) status = 'human';
 
@@ -1268,7 +1297,9 @@ app.post('/webhooks/events', async (req, res) => {
   // Detection time = answer -> AMD verdict, in ms (David: for their stats).
   if ((status === 'human' || status === 'machine') && leg.detectionMs == null && leg.answeredAt) {
     leg.detectionMs = Date.now() - leg.answeredAt;
-    addLog(runId, `leg ${legId + 1} - AMD verdict "${status}${sub ? ' (' + sub + ')' : ''}" after ${leg.detectionMs} ms`);
+    leg.detectionEndedAtIso = evIso;
+    if (leg.comfortStreaming) { leg.comfortStreaming = false; api('DELETE', 'https://api.nexmo.com/v1/calls/' + leg.uuid + '/stream').then((r) => addLog(runId, `leg ${legId + 1} - comfort stream stopped (${r.status})`)).catch(() => {}); }
+    addLog(runId, `leg ${legId + 1} - AMD verdict "${status}${sub ? ' (' + sub + ')' : ''}" after ${leg.detectionMs} ms (mode ${run.amdMode}; startedAt ${leg.startedAtIso || '-'}, answeredAt ${leg.answeredAtIso || '-'}, detectionEndedAt ${leg.detectionEndedAtIso})`);
   }
 
   if (status === 'human') {

@@ -123,6 +123,8 @@ curl -X POST "$BASE/api/call" -H "Content-Type: application/json" -d '{
 | `logToSf` | no | *(Optional, off by default.)* `true` to also write each outcome to Salesforce. Leave off to use the JSON webhook only. |
 | `undetermined` | no | What to do when machine detection reaches **no verdict** and only its timer fires. `auto` (default) sends the call to a human whenever the run has somewhere to put one; `human` always does; `machine` keeps the old behaviour of treating it as an answering machine. See below. |
 | `comfort` | no | Audio the caller hears **while detection runs**, instead of silence. `off` (default), `tone` (a quiet built-in room tone), or the id of a message you uploaded. `comfortUrl` takes a full HTTPS URL instead. |
+| `amdMode` | no | How Vonage runs machine detection. `default` (the default): asynchronous - the call starts straight away while detection listens in the background, so the comfort sound plays from the moment of answer; the human/machine verdict still arrives on the event webhook. `detect`: synchronous - nothing plays until the verdict. Detection time is the same in both. In our tests `default` occasionally returned an early `beep_timeout` (about 0.35 s after answer) on voicemails; `detect` did not. |
+| `comfortVia` | no | How the comfort sound is played. `hold` (default): as hold music in the call's conversation (needs `amdMode: default` to be heard). `stream`: streamed into the call from the answer event and stopped at the verdict - works with either `amdMode`, including `detect`. |
 
 **Undetermined detection.** Machine detection normally returns a verdict in 3-8
 seconds. If it returns nothing at all, its beep timer eventually fires and the
@@ -296,7 +298,14 @@ Auth is a short-lived RS256 JWT signed with your app private key.
 
 ## 8. Outcome webhook payloads (`resultWebhook`)
 
-One `call_result` per callout (full field reference in `Machine-Detect-Webhook-JSON.md`):
+One `call_result` per callout (full field reference in `Machine-Detect-Webhook-JSON.md`).
+
+Timing fields, on `call_result` and on every per-leg event (`machine_detected`, `human_connected`, `amd_undetermined`), ISO 8601 UTC with milliseconds, taken from Vonage's own event timestamps:
+- `startedAt` - the call was placed (Vonage `started` event)
+- `answeredAt` - the called party picked up; detection starts here (`answered` event)
+- `detectionEndedAt` - Vonage sent the human/machine verdict
+- `detectionMs` - answer to verdict in ms (unchanged); `amdMode` - the mode used for the call
+
 ```json
 {
   "event": "call_result",
@@ -314,6 +323,11 @@ One `call_result` per callout (full field reference in `Machine-Detect-Webhook-J
   "voicemailMessageId": null,
   "outcome": "human_transferred",
   "detail": null,
+  "detectionMs": 3123,
+  "startedAt": "2026-10-26T17:48:48.644Z",
+  "answeredAt": "2026-10-26T17:48:50.092Z",
+  "detectionEndedAt": "2026-10-26T17:48:53.377Z",
+  "amdMode": "default",
   "timeouts": { "ringSec": 45, "beepSec": 45, "agentSec": 30 },
   "at": "2026-08-26T10:15:20.100Z"
 }
