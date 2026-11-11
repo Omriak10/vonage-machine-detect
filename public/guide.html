@@ -129,7 +129,9 @@
       <tr><td><code>humanAction</code></td><td>Drop mode, when a human answers: <code>skip</code> / <code>forward</code> / <code>sip</code>.</td></tr>
       <tr><td><code>humanForward</code> / <code>sipUri</code></td><td>Where live answers go (a phone number, or a SIP address).</td></tr>
       <tr><td><code>sipHeaders</code></td><td>Custom SIP headers for your VCC (values support <code>{{whoId}} {{number}} {{name}}</code>).</td></tr>
-      <tr><td><code>messageId</code></td><td>Drop mode: which uploaded voicemail to play (see <code>/api/messages</code>).</td></tr>
+      <tr><td><code>messageId</code></td><td>Drop mode: which uploaded voicemail to play (see <code>/api/messages</code>). This is the fallback for any record that has no message of its own for the attempt.</td></tr>
+      <tr><td><code>members[].attempt</code> / <code>members[].messageId</code> / <code>members[].messages</code></td><td>Drop mode, per record: the attempt number of this call (otherwise counted per record, 1 on the first call), a message just for this call, or a map <code>{"1":"msgId","2":"msgId"}</code> of message per attempt. Unknown ids are refused up front.</td></tr>
+      <tr><td><code>attemptMessages</code></td><td>Drop mode: <code>{"1":"msgId","2":"msgId"}</code> for the whole run - the message per attempt for records without their own. Attempts not listed play <code>messageId</code>, then the default.</td></tr>
       <tr><td><code>ringTimeout</code></td><td>Ring the person this long with no answer, then hang up. Default 45.</td></tr>
       <tr><td><code>beepTimeout</code></td><td>Wait this long for the voicemail beep. Default 45.</td></tr>
       <tr><td><code>agentTimeout</code></td><td>Ring the agent this long on a transfer, then give up. Default 45.</td></tr>
@@ -155,6 +157,7 @@
       <tr><td><code>POST /api/message?name=</code></td><td>Upload a voicemail (raw WAV, 16-bit PCM 16 kHz mono). Returns its id.</td></tr>
       <tr><td><code>GET /api/messages</code></td><td>List uploaded voicemails.</td></tr>
       <tr><td><code>POST /api/list</code> / <code>GET /api/lists</code></td><td>Save + list reusable call lists.</td></tr>
+      <tr><td><code>GET /api/records</code> / <code>POST /api/records</code></td><td>Per-record voicemail by attempt number: <code>{records:[{number, messages:{"1":"msgId","2":"msgId"}}]}</code> or <code>{csv:"number,msg1,msg2,..."}</code>. Stored durably - survives restarts and redeploys. Also <code>PUT /api/record/:number</code>, <code>POST /api/record/:number/reset</code> (attempt counter back to 0), <code>DELETE /api/record/:number</code>.</td></tr>
     </table>
     <div class="tip">Full request/response reference is on the <a href="/code" style="color:var(--ink)"><b>API reference</b></a> page (also linked top-right).</div>
   </div></div></div>
@@ -175,7 +178,9 @@
   "answeredBy": "human",              <span class="c">// human | machine | none</span>
   "action": "transferred_to_agent",   <span class="c">// voicemail_left | transferred_to_agent | agents_busy | skipped | no_answer | failed</span>
   "transferredTo": { "type": "sip", "destination": "sip:queue@yourvcc.sip.vonage.com" },
-  "voicemailMessageId": null,
+  "voicemailMessageId": null,         <span class="c">// the message that was left (per-record/attempt, run, or "default")</span>
+  "attempt": 2,                       <span class="c">// this record's attempt number (drop mode)</span>
+  "messageSource": null,              <span class="c">// why that message: "record, attempt 2" / "run message (fallback)" / ...</span>
   "outcome": "human_transferred",
   "timeouts": { "ringSec": 45, "beepSec": 45, "agentSec": 30 },
   "at": "2026-08-26T10:15:20.100Z"

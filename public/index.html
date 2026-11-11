@@ -136,6 +136,18 @@ button:disabled{opacity:.4;cursor:default}
       <audio id="player" controls class="hide"></audio>
       <button id="clearBtn" class="ghost small hide" onclick="clearMsg()" style="margin-top:10px">Use automatic message instead</button>
     </div>
+    <label>Message per record and attempt <span style="font-weight:400;color:#86888a">(optional)</span></label>
+    <div class="rec">
+      <div class="hint" style="margin:0 0 10px">Give a record its own voicemail for each attempt: the 1st call to that number leaves message 1, the 2nd call message 2, and so on. A record or attempt without a message plays the voicemail chosen above (the fallback). Saved durably: it stays after a restart or redeploy. The attempt counter advances each time the number is dialled; your API call can also state the attempt itself.</div>
+      <textarea id="recCsv" style="min-height:70px" placeholder="number, message for attempt 1, message for attempt 2, ...  (message name or id, blank = fallback)&#10;447700900461, Spring campaign, Second try, Last try&#10;447700900462, Spring campaign"></textarea>
+      <div class="row">
+        <button class="ghost small" onclick="saveRecords()">Save records</button>
+        <button class="ghost small" onclick="document.getElementById('recFile').click()">&#8593; Upload CSV</button>
+        <input id="recFile" type="file" accept=".csv,text/csv,text/plain" class="hide" onchange="uploadRecCsv(this.files[0])">
+        <span class="st" id="recordsSt"></span>
+      </div>
+      <div id="recList" style="margin-top:10px;font-size:12.5px"></div>
+    </div>
     <label>Calls at once</label>
     <input id="conc" type="number" min="1" max="10" value="1">
     <div class="hint">Simultaneous calls for this run (1-10). Pace it to your available agents.</div>
@@ -287,6 +299,42 @@ async function loadMessages(selectId) {
     if (selectId) sel.value = selectId;
   } catch (e) {}
 }
+// ------------------------------------------- per-record messages by attempt
+async function saveRecords() {
+  const csv = el('recCsv').value.trim();
+  if (!csv) return alert('enter at least one line: number, message for attempt 1, message for attempt 2, ...');
+  el('recordsSt').textContent = 'saving...';
+  try {
+    const r = await fetch('/api/records', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ csv }) });
+    const d = await r.json();
+    if (!r.ok) { el('recordsSt').textContent = d.error || 'save failed'; return; }
+    el('recordsSt').innerHTML = '<b>' + d.count + '</b> record' + (d.count === 1 ? '' : 's') + ' saved' + (d.durable ? ' - kept after restarts and redeploys.' : ' (tmp only - durable store unavailable).');
+    el('recCsv').value = '';
+    loadRecords();
+  } catch (e) { el('recordsSt').textContent = 'save failed: ' + e.message; }
+}
+function uploadRecCsv(file) {
+  if (!file) return;
+  const rd = new FileReader();
+  rd.onload = () => { el('recCsv').value = String(rd.result || '').trim(); el('recordsSt').textContent = 'CSV loaded - check it, then Save records.'; };
+  rd.readAsText(file);
+}
+async function loadRecords() {
+  try {
+    const d = await (await fetch('/api/records')).json();
+    const box = el('recList');
+    if (!d.records.length) { box.innerHTML = '<span style="color:#86888a">No records have their own messages yet.</span>'; return; }
+    const esc = (s) => String(s == null ? '' : s).replace(/</g, '&lt;');
+    box.innerHTML = '<table style="width:100%;border-collapse:collapse"><tr style="text-align:left;color:#86888a"><th style="font-weight:500;padding:4px 6px 4px 0">Number</th><th style="font-weight:500;padding:4px 6px">Messages by attempt</th><th style="font-weight:500;padding:4px 6px">Dialled</th><th></th></tr>'
+      + d.records.map((r) => {
+        const ms = Object.entries(r.messages).map(([a, m]) => a + ': ' + (m.missing ? '<span style="color:#b00">' + esc(m.id) + ' (deleted!)</span>' : esc(m.name))).join(' &middot; ') || '<span style="color:#86888a">none (fallback)</span>';
+        return '<tr style="border-top:1px solid #e6e6e6"><td style="padding:6px 6px 6px 0;white-space:nowrap"><b>' + esc(r.number) + '</b>' + (r.name ? '<br><span style="color:#86888a">' + esc(r.name) + '</span>' : '') + '</td><td style="padding:6px">' + ms + '</td><td style="padding:6px;white-space:nowrap">' + r.attempts + ' time' + (r.attempts === 1 ? '' : 's') + '<br><span style="color:#86888a">next = attempt ' + (r.attempts + 1) + '</span></td>'
+          + '<td style="padding:6px;white-space:nowrap;text-align:right"><button class="ghost small" style="padding:4px 8px;font-size:11.5px" onclick="resetRecord(\'' + esc(r.number) + '\')">Reset count</button> <button class="ghost small" style="padding:4px 8px;font-size:11.5px" onclick="deleteRecord(\'' + esc(r.number) + '\')">Remove</button></td></tr>';
+      }).join('') + '</table>';
+  } catch (e) {}
+}
+async function resetRecord(n) { await fetch('/api/record/' + n + '/reset', { method: 'POST' }); loadRecords(); }
+async function deleteRecord(n) { if (!confirm('Remove the messages for ' + n + '? Its calls will play the fallback message.')) return; await fetch('/api/record/' + n, { method: 'DELETE' }); loadRecords(); }
 function modeChanged() {
   const drop = el('mode').value === 'drop';
   el('single').classList.toggle('hide', drop);
@@ -537,7 +585,7 @@ const barEls = document.querySelectorAll('#bars i');
 function setBars(peak) { barEls.forEach((b, i) => { const h = 3 + Math.max(0, peak * 20 - i * 1.5) * (1 + (i % 3)); b.style.height = Math.min(20, h) + 'px'; }); }
 
 async function loadConfig() { try { const d = await (await fetch('/api/config')).json(); if (d.from) el('from').value = d.from; } catch (e) {} }
-refreshMsg(); sfStatus(); loadConfig(); loadMessages(); loadLists(); refreshComfort();
+refreshMsg(); sfStatus(); loadConfig(); loadMessages(); loadLists(); refreshComfort(); loadRecords();
 el('comfortSave').onclick = saveComfort;
 el('comfortPreview').onclick = previewComfort;
 el('comfortSound').onchange = comfortPaint;

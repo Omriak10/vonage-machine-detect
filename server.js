@@ -30,8 +30,15 @@
 //   mode           detect | detect_beep | drop
 //   to, forward    transfer modes: single number + forward-on-machine number
 //   numbers        drop: newline/comma-separated list, or:
-//   members        drop: [{number, whoId?, name?}] (e.g. from /api/sf/list/:id)
-//   messageId      drop: which named message to play (default: default/auto)
+//   members        drop: [{number, whoId?, name?, attempt?, messageId?, messages?}]
+//                  (e.g. from /api/sf/list/:id). attempt = this call's attempt
+//                  number (else counted per record); messageId = play this
+//                  message for this call; messages = {attempt: messageId|name}
+//   messageId      drop: the run's message (fallback for records without their own)
+//   attemptMessages drop: {attempt: messageId|name} run-wide message per attempt
+//   Per-record messages by attempt (durable, survive restart + redeploy):
+//   GET /api/records, POST /api/records {records:[...]}|{csv}, PUT /api/record/:number,
+//   POST /api/record/:number/reset, DELETE /api/record/:number
 //   concurrency    drop: simultaneous calls, 1-10 (default 1)
 //   humanAction    drop: skip (default) | forward | sip
 //   humanForward   drop + humanAction=forward: phone number for live answers
@@ -286,13 +293,93 @@ function parseMembers(text) {
   }).filter(Boolean);
 }
 
-// the NCCO played into a voicemail for a given run
-function dropNcco(run) {
+// ------------------------------------------- per-record messages by attempt
+// (11 Nov 2026, David) A record = a phone number. Each record can carry its own
+// voicemail message PER ATTEMPT NUMBER: attempt 1 plays message A, attempt 2
+// message B, and so on. Anything not covered falls back to the run's message,
+// then the default announcement. Records live in durable instance state (hash
+// `md-records`, one field per number) so they survive a restart AND a redeploy;
+// a tmp mirror serves local runs. The attempt counter is kept per record and
+// advances every time the record is dialled in a drop run, unless the call
+// request states the attempt explicitly (`members[].attempt`).
+const RECORDS_HASH = 'md-records';
+const REC_FILE = path.join(MSG_DIR, 'md-records.json');
+let records = {}; // number -> { messages: {"1": msgId, "2": msgId}, attempts, lastAt, name? }
+async function loadRecords() {
+  try { if (fs.existsSync(REC_FILE)) records = JSON.parse(fs.readFileSync(REC_FILE, 'utf8')) || {}; } catch {}
+  const st = vcrState(); if (!st) return;
+  try {
+    const all = await st.mapGetAll(RECORDS_HASH); let n = 0;
+    for (const [number, raw] of Object.entries(all || {})) { try { records[number] = typeof raw === 'string' ? JSON.parse(raw) : raw; n++; } catch {} }
+    if (n) console.log('[state] restored ' + n + ' record message assignment(s) from durable storage');
+    mirrorRecords();
+  } catch (e) { console.error('[state] load records failed', e.message); }
+}
+const mirrorRecords = () => { try { fs.writeFileSync(REC_FILE, JSON.stringify(records)); } catch {} };
+async function saveRecord(number) {
+  mirrorRecords();
+  const st = vcrState(); if (!st) return false;
+  try { await st.mapSet(RECORDS_HASH, { [number]: JSON.stringify(records[number]) }); return true; }
+  catch (e) { console.error('[state] save record', number, e.message); return false; }
+}
+async function deleteRecord(number) {
+  delete records[number]; mirrorRecords();
+  const st = vcrState(); if (!st) return;
+  try { await st.mapDelete(RECORDS_HASH, [number]); } catch (e) { console.error('[state] delete record', number, e.message); }
+}
+// a message reference may be an id or the exact name of an uploaded message
+function resolveMessageRef(ref) {
+  const s = String(ref == null ? '' : ref).trim(); if (!s) return null;
+  if (messages[s]) return s;
+  const hit = Object.entries(messages).find(([, m]) => String(m.name).toLowerCase() === s.toLowerCase());
+  return hit ? hit[0] : null;
+}
+// {attempt: ref} -> {attempt: id}; throws on an unknown message so a typo never silently plays the fallback
+function normAttemptMessages(obj, where) {
+  const out = {};
+  if (!obj || typeof obj !== 'object') return out;
+  for (const [k, v] of Object.entries(obj)) {
+    const n = parseInt(k, 10); if (!(n >= 1 && n <= 99)) throw new Error(`${where}: attempt "${k}" must be a number from 1 to 99`);
+    if (v == null || String(v).trim() === '' || String(v).trim().toLowerCase() === 'default') continue; // blank = fallback
+    const id = resolveMessageRef(v); if (!id) throw new Error(`${where}: attempt ${n} names an unknown message "${v}" - see GET /api/messages`);
+    out[String(n)] = id;
+  }
+  return out;
+}
+// Which message a dialled record gets, and why. Order:
+//   1. members[].messageId in the call request (this call, any attempt)
+//   2. members[].messages[attempt] in the call request
+//   3. the record's stored messages[attempt] (durable, set via /api/records)
+//   4. the run's attemptMessages[attempt]
+//   5. the run's messageId, else the default announcement (fallback)
+function resolveLegMessage(run, m) {
+  const rec = records[m.number];
+  const explicit = parseInt(m.attempt, 10);
+  const attempt = explicit >= 1 ? explicit : ((rec && rec.attempts) || 0) + 1;
+  const a = String(attempt);
+  if (m.messageId && messages[m.messageId]) return { attempt, id: m.messageId, source: 'call request' };
+  if (m.messages && m.messages[a]) return { attempt, id: m.messages[a], source: `call request, attempt ${attempt}` };
+  if (rec && rec.messages && rec.messages[a] && messages[rec.messages[a]]) return { attempt, id: rec.messages[a], source: `record, attempt ${attempt}` };
+  if (run.attemptMessages && run.attemptMessages[a]) return { attempt, id: run.attemptMessages[a], source: `run, attempt ${attempt}` };
+  if (run.messageId && messages[run.messageId]) return { attempt, id: run.messageId, source: 'run message (fallback)' };
+  return { attempt, id: null, source: 'default message (fallback)' };
+}
+// advance the record's attempt counter (durable) when it is dialled
+function noteAttempt(m, attempt) {
+  const rec = records[m.number] || (records[m.number] = { messages: {}, attempts: 0 });
+  rec.attempts = Math.max(rec.attempts || 0, attempt); rec.lastAt = Date.now();
+  if (m.name && !rec.name) rec.name = m.name;
+  saveRecord(m.number);
+}
+const recordsReady = loadRecords();
+
+// the NCCO played into a voicemail for a given run (or a specific leg, which may
+// carry its own per-record / per-attempt message)
+function dropNcco(run, leg) {
   // level: 1 = maximum playback volume (range -1..1, default 0). Voicemails were
   // recording the message too quietly at the default level.
-  if (run.messageId && messages[run.messageId]) {
-    return [{ action: 'stream', streamUrl: [HOST + '/message/' + run.messageId + '.wav'], level: 1 }];
-  }
+  const id = leg && leg.messageId && messages[leg.messageId] ? leg.messageId : (run.messageId && messages[run.messageId] ? run.messageId : null);
+  if (id) return [{ action: 'stream', streamUrl: [HOST + '/message/' + id + '.wav'], level: 1 }];
   if (dropMessage) return [{ action: 'stream', streamUrl: [HOST + '/message.wav'], level: 1 }];
   return [{ action: 'talk', text: AUTO_MESSAGE, language: AUTO_LANG, level: 1, premium: true }];
 }
@@ -326,8 +413,11 @@ function boostWav(buf, targetFrac = 0.97, maxGain = 12) {
     return out;
   } catch (e) { return buf; }
 }
-const msgLabel = (run) => run.messageId && messages[run.messageId]
-  ? `message "${messages[run.messageId].name}"` : (dropMessage ? 'default recorded message' : 'automatic message');
+const msgLabel = (run, leg) => {
+  const id = leg && leg.messageId && messages[leg.messageId] ? leg.messageId : (run.messageId && messages[run.messageId] ? run.messageId : null);
+  const base = id ? `message "${messages[id].name}"` : (dropMessage ? 'default recorded message' : 'automatic message');
+  return leg && leg.attempt ? `${base} (attempt ${leg.attempt}, ${leg.msgSource})` : base;
+};
 
 // how long the dropped message plays, so we can hang up the moment it ends
 // instead of waiting for the voicemail's max-length timeout.
@@ -348,9 +438,10 @@ function wavSeconds(buf) {
   if (buf && buf.length) return buf.length / 32000; // assume 16-bit/16kHz mono
   return 0;
 }
-function messageDurationMs(run) {
+function messageDurationMs(run, leg) {
   let sec = 0;
-  if (run.messageId && messages[run.messageId]) { try { sec = wavSeconds(fs.readFileSync(messages[run.messageId].file)); } catch (e) {} }
+  const id = leg && leg.messageId && messages[leg.messageId] ? leg.messageId : (run.messageId && messages[run.messageId] ? run.messageId : null);
+  if (id) { try { sec = wavSeconds(fs.readFileSync(messages[id].file)); } catch (e) {} }
   else if (dropMessage) sec = wavSeconds(dropMessage);
   else sec = String(AUTO_MESSAGE).split(/\s+/).length / 2.6 + 1.5; // TTS estimate
   if (!sec || sec < 1) sec = 8; // safety floor
@@ -410,6 +501,12 @@ async function placeLeg(runId, legId) {
   // go out from it, with a pool they spread across the numbers.
   const fromNum = run.fromPool[legId % run.fromPool.length];
   const leg = { m, from: fromNum, uuid: null, transferred: false, done: false, outcome: null };
+  if (run.mode === 'drop') {
+    // which voicemail this record gets on THIS attempt (per-record / per-attempt, else fallback)
+    const pick = resolveLegMessage(run, m);
+    leg.attempt = pick.attempt; leg.messageId = pick.id; leg.msgSource = pick.source;
+    noteAttempt(m, pick.attempt);
+  }
   run.legs[legId] = leg; // active slot was reserved by launchNext
   // `detect_beep` hunts for the voicemail beep and so leans towards "machine" -
   // it can misread a live person's "hello" as a machine. Only use it for pure
@@ -611,7 +708,9 @@ function pushResult(run, legId, outcome, detail) {
       answeredBy: meta.answeredBy,              // human | machine | none
       action: meta.action,                      // voicemail_left | transferred_to_agent | skipped | live_conversation | no_answer | failed
       transferredTo: (String(meta.action).startsWith('transferred') && agent) ? agent : null,
-      voicemailMessageId: outcome === 'machine_message_dropped' ? (run.messageId || 'default') : null,
+      voicemailMessageId: outcome === 'machine_message_dropped' ? (leg.messageId || run.messageId || 'default') : null,
+      attempt: leg.attempt || null,             // this record's attempt number (drop mode)
+      messageSource: outcome === 'machine_message_dropped' ? (leg.msgSource || null) : null, // why that message: "record, attempt 2" / "run message (fallback)" ...
       outcome,                                  // full internal status, for reference
       detail: detail || null,
       detectionMs: leg.detectionMs == null ? null : leg.detectionMs, // answer -> AMD verdict
@@ -940,9 +1039,19 @@ app.post('/api/call', async (req, res) => {
     ? b.comfortUrl
     : comfortUrlFor(typeof b.comfort === 'string' ? b.comfort.trim() : null);
 
-  const toMember = (x) => (typeof x === 'string'
-    ? { number: clean(x) }
-    : { number: clean(x.number), whoId: x.whoId, name: x.name });
+  // a member may carry its own voicemail choice: messageId (this call), messages
+  // {attempt: messageId|name}, and/or an explicit attempt number
+  let memberErr = null;
+  const toMember = (x) => {
+    if (typeof x === 'string') return { number: clean(x) };
+    const m = { number: clean(x.number), whoId: x.whoId, name: x.name };
+    try {
+      if (x.attempt != null && x.attempt !== '') { const a = parseInt(x.attempt, 10); if (!(a >= 1 && a <= 99)) throw new Error(`member ${m.number}: attempt must be 1-99`); m.attempt = a; }
+      if (x.messageId) { const id = resolveMessageRef(x.messageId); if (!id) throw new Error(`member ${m.number}: unknown messageId "${x.messageId}" - see GET /api/messages`); m.messageId = id; }
+      if (x.messages) m.messages = normAttemptMessages(x.messages, `member ${m.number}`);
+    } catch (e) { memberErr = memberErr || e.message; }
+    return m;
+  };
 
   const run = {
     id: runId, mode, from, fromPool, logToSf, resultWebhook,
@@ -966,6 +1075,7 @@ app.post('/api/call', async (req, res) => {
     } else {
       list = parseMembers(b.numbers).map(toMember).filter((m) => m.number.length >= 7);
     }
+    if (memberErr) return res.status(400).json({ error: memberErr });
     if (!list.length) return res.status(400).json({ error: 'enter at least one valid number in the list' });
     run.list = list;
     run.concurrency = Math.max(1, Math.min(10, parseInt(b.concurrency, 10) || 1));
@@ -973,6 +1083,12 @@ app.post('/api/call', async (req, res) => {
     if (b.messageId && !run.messageId && b.messageId !== 'default') {
       return res.status(400).json({ error: `unknown messageId "${b.messageId}" - see GET /api/messages` });
     }
+    // run-wide message per attempt number: {"1": id, "2": id} - used for records
+    // that have no message of their own for that attempt
+    try { run.attemptMessages = normAttemptMessages(b.attemptMessages, 'attemptMessages'); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+    const withOwn = list.filter((m) => m.messageId || (m.messages && Object.keys(m.messages).length) || records[m.number]).length;
+    run.recordMessages = withOwn;
     // what to do when a HUMAN answers
     run.humanAction = ['skip', 'forward', 'sip'].includes(b.humanAction) ? b.humanAction : 'skip';
     if (run.humanAction === 'forward') {
@@ -1017,7 +1133,9 @@ app.post('/api/call', async (req, res) => {
     }
     runs[runId] = run;
     persist(run);
-    addLog(runId, `drop run started - ${list.length} number${list.length === 1 ? '' : 's'}, concurrency ${run.concurrency} from ${fromPool.length === 1 ? fromPool[0] : fromPool.length + ' numbers'}, ${msgLabel(run)}`
+    addLog(runId, `drop run started - ${list.length} number${list.length === 1 ? '' : 's'}, concurrency ${run.concurrency} from ${fromPool.length === 1 ? fromPool[0] : fromPool.length + ' numbers'}, fallback ${msgLabel(run)}`
+      + (run.recordMessages ? ` (${run.recordMessages} record${run.recordMessages === 1 ? ' has' : 's have'} their own message by attempt)` : '')
+      + (Object.keys(run.attemptMessages || {}).length ? `, run messages by attempt: ${Object.entries(run.attemptMessages).map(([a, id]) => `${a}=${messages[id] ? messages[id].name : id}`).join(', ')}` : '')
       + (run.humanAction === 'sip' ? `, humans -> SIP agent` : run.humanAction === 'forward' ? `, humans -> ${run.humanForward}` : ', humans skipped')
       + (run.agentMode === 'room' ? ` (agent room: ${run.agents} parked agent${run.agents === 1 ? '' : 's'}, burst ${run.burstId})` : '')
       + (run.detection === 'off' ? ', detection OFF (every answer = human)' : '')
@@ -1061,6 +1179,7 @@ app.get('/api/run/:id', (req, res) => {
     legs: Object.entries(run.legs).map(([id, l]) => ({
       legId: Number(id), number: l.m.number, name: l.m.name || null, whoId: l.m.whoId || null,
       callUuid: l.uuid, outcome: l.outcome, finished: !!l.finished,
+      attempt: l.attempt || null, voicemailMessageId: l.messageId || null, messageSource: l.msgSource || null,
     })),
   });
 });
@@ -1124,6 +1243,69 @@ app.delete('/api/list/:id', (req, res) => {
   const nm = lists[req.params.id].name;
   delete lists[req.params.id]; saveListIndex();
   addLog('list', `deleted list "${nm}"`);
+  res.json({ ok: true });
+});
+
+// ------------------------------------------- per-record messages by attempt
+// GET /api/records                 -> every record with its messages per attempt + attempt counter
+// POST /api/records {records:[{number, messages:{1:id|name,2:..}, name?, attempts?}]}  or {csv:"number,msg1,msg2,..."}
+//                                  -> bulk upsert (replaces each record's message map; attempts reset only if given)
+// PUT /api/record/:number {messages, name?, attempts?} -> set one record
+// POST /api/record/:number/reset   -> attempt counter back to 0 (next call = attempt 1)
+// DELETE /api/record/:number       -> remove the record (its calls fall back to the run/default message)
+const recordView = (number, r) => ({
+  number, name: r.name || null, attempts: r.attempts || 0, lastAt: r.lastAt || null,
+  messages: Object.fromEntries(Object.entries(r.messages || {}).sort((a, b) => Number(a[0]) - Number(b[0])).map(([a, id]) => [a, { id, name: messages[id] ? messages[id].name : null, missing: !messages[id] }])),
+});
+app.get('/api/records', (req, res) => res.json({
+  count: Object.keys(records).length,
+  records: Object.entries(records).sort((a, b) => (b[1].lastAt || 0) - (a[1].lastAt || 0)).map(([n, r]) => recordView(n, r)),
+}));
+// csv: number, message for attempt 1, message for attempt 2, ... (id or name; blank = fallback for that attempt)
+function parseRecordCsv(text) {
+  return String(text || '').split(/\r?\n/).map((line) => {
+    const l = line.replace(/\/\/.*$/, '').trim(); if (!l) return null;
+    const parts = l.split(/[,;\t]/).map((s) => s.trim());
+    const number = clean(parts[0]); if (number.length < 7) return null;
+    const msgs = {}; parts.slice(1).forEach((p, i) => { if (p) msgs[String(i + 1)] = p; });
+    return { number, messages: msgs };
+  }).filter(Boolean);
+}
+async function upsertRecord(x) {
+  const number = clean(x.number); if (number.length < 7) throw new Error(`"${x.number}" is not a valid number`);
+  const msgs = normAttemptMessages(x.messages, number);
+  const rec = records[number] || { messages: {}, attempts: 0 };
+  rec.messages = msgs;
+  if (x.name != null) rec.name = String(x.name).slice(0, 120);
+  if (x.attempts != null && x.attempts !== '') { const a = parseInt(x.attempts, 10); if (!(a >= 0 && a <= 99)) throw new Error(`${number}: attempts must be 0-99`); rec.attempts = a; }
+  records[number] = rec;
+  const ok = await saveRecord(number);
+  return { number, durable: ok };
+}
+app.post('/api/records', async (req, res) => {
+  const b = req.body || {};
+  const items = Array.isArray(b.records) ? b.records : (b.csv ? parseRecordCsv(b.csv) : []);
+  if (!items.length) return res.status(400).json({ error: 'send records:[{number, messages:{1:"<message id or name>", 2:...}}] or csv:"number,msg1,msg2,..."' });
+  const out = []; let durable = true;
+  try { for (const x of items) { const r = await upsertRecord(x); out.push(r.number); if (!r.durable) durable = false; } }
+  catch (e) { return res.status(400).json({ error: e.message, saved: out }); }
+  addLog('rec', `${out.length} record${out.length === 1 ? '' : 's'} given message${out.length === 1 ? '' : 's'} by attempt` + (durable ? ' (stored durably)' : ' (durable store unavailable - tmp only)'), durable ? 'good' : 'warn');
+  res.json({ ok: true, count: out.length, numbers: out, durable });
+});
+app.put('/api/record/:number', async (req, res) => {
+  try { const r = await upsertRecord(Object.assign({}, req.body || {}, { number: req.params.number })); addLog('rec', `record ${r.number}: messages by attempt saved`, 'good'); res.json({ ok: true, record: recordView(r.number, records[r.number]), durable: r.durable }); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+app.post('/api/record/:number/reset', async (req, res) => {
+  const number = clean(req.params.number); const rec = records[number];
+  if (!rec) return res.status(404).json({ error: 'unknown record' });
+  rec.attempts = 0; await saveRecord(number);
+  res.json({ ok: true, record: recordView(number, rec) });
+});
+app.delete('/api/record/:number', async (req, res) => {
+  const number = clean(req.params.number);
+  if (!records[number]) return res.status(404).json({ error: 'unknown record' });
+  await deleteRecord(number); addLog('rec', `record ${number} removed - it falls back to the run/default message`);
   res.json({ ok: true });
 });
 
@@ -1403,15 +1585,15 @@ app.post('/webhooks/events', async (req, res) => {
         if (leg.dropTimer) { clearTimeout(leg.dropTimer); leg.dropTimer = null; }
         const r = await api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, {
           action: 'transfer',
-          destination: { type: 'ncco', ncco: dropNcco(run) },
+          destination: { type: 'ncco', ncco: dropNcco(run, leg) },
         });
         if (r.status < 300) {
           leg.outcome = 'machine_message_dropped';
-          addLog(runId, `leg ${legId + 1} - ${msgLabel(run)} left on the voicemail`, 'good');
+          addLog(runId, `leg ${legId + 1} - ${msgLabel(run, leg)} left on the voicemail`, 'good');
           logSf(runId, legId, 'machine_message_left', 'Voicemail message left.');
           // hang up a few seconds after the message ends (buffer so the tail is
           // fully recorded), rather than waiting for the voicemail max-length.
-          const durMs = messageDurationMs(run);
+          const durMs = messageDurationMs(run, leg);
           leg.hangTimer = setTimeout(() => {
             api('PUT', 'https://api.nexmo.com/v1/calls/' + leg.uuid, { action: 'hangup' }).catch(() => {});
             addLog(runId, `leg ${legId + 1} - message finished (~${Math.round(durMs / 1000)}s), hanging up`, 'info');
@@ -1600,5 +1782,6 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 server.listen(PORT, () => {
   console.log('Machine Detect (VCR) on :' + PORT);
-  reconcile().catch((e) => console.error('[resume] error', e.message));
+  // records (per-attempt messages + attempt counters) must be back before any resumed leg is dialled
+  recordsReady.then(() => reconcile()).catch((e) => console.error('[resume] error', e.message));
 });

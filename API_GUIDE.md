@@ -107,10 +107,11 @@ curl -X POST "$BASE/api/call" -H "Content-Type: application/json" -d '{
 |-------|----------|---------|
 | `mode` | yes | `drop`. |
 | `numbers` | one of these | Newline/comma-separated numbers. CSV per line: `number[,name[,whoId]]`. |
-| `members` | one of these | `[{number, name?, whoId?}]` - structured list (e.g. from Salesforce). |
+| `members` | one of these | `[{number, name?, whoId?, attempt?, messageId?, messages?}]` - structured list (e.g. from Salesforce). The three optional fields pick the voicemail per record, see section 3c. |
 | `listId` | one of these | Id of a **saved list** (see `/api/list`). |
 | `concurrency` | no | Simultaneous calls, 1-10 (default 1). |
-| `messageId` | no | Which **named** voicemail to play; omit for the default/auto message. |
+| `messageId` | no | Which **named** voicemail to play; omit for the default/auto message. With per-record messages (3c) this is the **fallback**. |
+| `attemptMessages` | no | `{"1": "<messageId or name>", "2": "..."}` - run-wide message per attempt number, for records that have none of their own. |
 | `humanAction` | no | `skip` (default) / `forward` / `sip` - what to do when a human answers. |
 | `humanForward` | if `forward` | Phone number to bridge live answers to. |
 | `sipUri` | if `sip` | SIP endpoint for live answers, e.g. Vonage Contact Center. |
@@ -146,15 +147,73 @@ default, so nothing changes unless you ask for it.
 your agent's screen pops the right record:
 `{{whoId}}`, `{{number}}`, `{{name}}`, `{{runId}}`, `{{legId}}`.
 
+### 3c. A different voicemail per record and per attempt
+
+Each record (phone number) can have its own message for each **attempt number**:
+the first call leaves message A, the second call message B, and so on. Anything
+not covered falls back to the run's `messageId`, then to the default announcement,
+so a record with no assignment behaves exactly as before.
+
+**Where the attempt number comes from.** Either you send it (`members[].attempt`),
+or the app counts it: a durable counter per record goes up every time the record
+is dialled in a drop run (first call = attempt 1). `POST /api/record/:number/reset`
+sets it back to 0. A record you never registered is counted too, so `attemptMessages`
+works without any registration.
+
+**Two ways to assign messages.**
+
+1. Store them once, durably (survives restarts and redeploys):
+```bash
+curl -X POST "$BASE/api/records" -H "Content-Type: application/json" -d '{
+  "records": [
+    { "number": "447700900123", "messages": { "1": "a1b2c3d4", "2": "e5f6a7b8", "3": "Last try" } },
+    { "number": "447700900124", "messages": { "1": "a1b2c3d4" } }
+  ]
+}'
+# or as CSV: number, message for attempt 1, message for attempt 2, ...
+curl -X POST "$BASE/api/records" -H "Content-Type: application/json" -d '{"csv": "447700900123,a1b2c3d4,e5f6a7b8\n447700900124,a1b2c3d4"}'
+```
+A message may be given by id or by its exact name. An unknown message is refused with
+a 400 naming the record and attempt, so a typo can never silently play the fallback.
+Then start runs as usual; nothing else changes in the call request.
+
+2. Or send them with the call, per member:
+```json
+{ "mode": "drop", "members": [
+  { "number": "447700900123", "attempt": 2, "messages": { "1": "a1b2c3d4", "2": "e5f6a7b8" } },
+  { "number": "447700900124", "messageId": "e5f6a7b8" }
+], "attemptMessages": { "1": "a1b2c3d4", "2": "e5f6a7b8" }, "messageId": "a1b2c3d4" }
+```
+
+**Resolution order** for a record on a given attempt:
+1. `members[].messageId` in the call request (this call, whatever the attempt)
+2. `members[].messages[attempt]` in the call request
+3. the record's stored `messages[attempt]` (`/api/records`)
+4. the run's `attemptMessages[attempt]`
+5. the run's `messageId`, else the default announcement (the fallback)
+
+Every `call_result` carries `attempt`, `voicemailMessageId` (what was left) and
+`messageSource` (which rule picked it, e.g. `record, attempt 2` or
+`run message (fallback)`); the run log says the same in words.
+
+| Call | What it does |
+|------|--------------|
+| `GET /api/records` | Every record: messages per attempt, attempt counter, last dialled. |
+| `POST /api/records` `{records:[{number, messages, name?, attempts?}]}` or `{csv}` | Bulk set (replaces each listed record's message map; the counter is only changed when `attempts` is given). |
+| `PUT /api/record/:number` `{messages, name?, attempts?}` | Set one record. |
+| `POST /api/record/:number/reset` | Attempt counter back to 0 (next call is attempt 1). |
+| `DELETE /api/record/:number` | Remove the record (back to run/default message). |
+
 ---
 
 ## 4. Components you can use
 
 ### Component: Voicemail messages
-What plays when a machine answers in `drop` mode. Three sources, in priority order:
-1. A **named** message you uploaded (`messageId`).
-2. The **default** uploaded message (no `messageId`).
-3. Built-in **TTS** fallback (`AUTO_MESSAGE`) if nothing is uploaded - zero setup.
+What plays when a machine answers in `drop` mode. Sources, in priority order:
+1. The record's own message for this **attempt** (section 3c), if any.
+2. A **named** message you uploaded (`messageId`).
+3. The **default** uploaded message (no `messageId`).
+4. Built-in **TTS** fallback (`AUTO_MESSAGE`) if nothing is uploaded - zero setup.
 
 Audio must be **16-bit PCM WAV, 16 kHz mono** (what Vonage's `stream` action needs);
 the UI encodes this client-side. Endpoints:
@@ -321,6 +380,8 @@ Timing fields, on `call_result` and on every per-leg event (`machine_detected`, 
   "action": "transferred_to_agent",
   "transferredTo": { "type": "sip", "destination": "sip:contact-center@example.sip.vonage.com" },
   "voicemailMessageId": null,
+  "attempt": 2,
+  "messageSource": null,
   "outcome": "human_transferred",
   "detail": null,
   "detectionMs": 3123,
@@ -375,6 +436,11 @@ repo - config is env only (`.env.example` / `vcr.yml.example` are placeholders).
 | `POST` | `/api/list` | Save a reusable call list. |
 | `GET` | `/api/lists`, `/api/list/registry/:id` | List / read saved lists. |
 | `DELETE` | `/api/list/:id` | Delete a list. |
+| `GET` | `/api/records` | Per-record messages by attempt + attempt counters. |
+| `POST` | `/api/records` | Bulk set per-record messages (`records` or `csv`). |
+| `PUT` | `/api/record/:number` | Set one record's messages by attempt. |
+| `POST` | `/api/record/:number/reset` | Attempt counter back to 0. |
+| `DELETE` | `/api/record/:number` | Remove a record's assignment. |
 | `GET` | `/api/sf/status`, `/api/sf/lists`, `/api/sf/list/:id` | Salesforce status / campaigns / members. |
 | `POST` | `/api/sf/connect` | Configure Salesforce at runtime. |
 | `GET` | `/api/log?since=` | Event timeline (for the UI). |
