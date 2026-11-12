@@ -1079,9 +1079,11 @@ app.post('/api/call', async (req, res) => {
     if (!list.length) return res.status(400).json({ error: 'enter at least one valid number in the list' });
     run.list = list;
     run.concurrency = Math.max(1, Math.min(10, parseInt(b.concurrency, 10) || 1));
-    run.messageId = b.messageId && messages[b.messageId] ? String(b.messageId) : null;
-    if (b.messageId && !run.messageId && b.messageId !== 'default') {
-      return res.status(400).json({ error: `unknown messageId "${b.messageId}" - see GET /api/messages` });
+    // the run's voicemail: an uploaded message's id OR its exact name (`message`/`messageName` are aliases of `messageId`)
+    const msgRef = b.messageId || b.messageName || b.message || '';
+    run.messageId = msgRef && msgRef !== 'default' ? resolveMessageRef(msgRef) : null;
+    if (msgRef && msgRef !== 'default' && !run.messageId) {
+      return res.status(400).json({ error: `unknown message "${msgRef}" - give the id or the exact name of an uploaded message, see GET /api/messages` });
     }
     // run-wide message per attempt number: {"1": id, "2": id} - used for records
     // that have no message of their own for that attempt
@@ -1120,7 +1122,7 @@ app.post('/api/call', async (req, res) => {
       run.busyMessage = String(b.busyMessage || 'Sorry, all our agents are busy right now. We will call you back shortly. Goodbye.').slice(0, 500);
       run.holdMessage = String(b.holdMessage || 'Please hold, we are connecting you to an agent.').slice(0, 300);
       run.busyLang = String(b.busyLang || 'en-US').slice(0, 10);
-      run.busyMessageId = b.busyMessageId && messages[b.busyMessageId] ? String(b.busyMessageId) : null;
+      run.busyMessageId = b.busyMessageId ? resolveMessageRef(b.busyMessageId) : null; // id or name
       run.busyWait = num(b.busyWait, 0, 0, 60);
       run.agentSettle = num(b.agentSettle != null ? b.agentSettle : b.roomWarmup, 3, 0, 30); // secs after the agent leg answers before the room counts as ready (VCC side settles)
       run.readyTimeout = num(b.readyTimeout, 30, 0, 120);   // customers are not dialled until a room is ready, or this many secs have passed
@@ -1192,6 +1194,12 @@ app.post('/api/message', express.raw({ type: '*/*', limit: '15mb' }), (req, res)
   const audio = boostWav(req.body); // normalise/amplify so it records loudly
   const name = String(req.query.name || '').trim();
   if (name) {
+    // names are how calls reference messages (next to ids), so a name must be unique
+    const dup = Object.entries(messages).find(([, m]) => String(m.name).toLowerCase() === name.toLowerCase());
+    if (dup && !/^(1|true|yes)$/i.test(String(req.query.replace || ''))) {
+      return res.status(409).json({ error: `a message named "${dup[1].name}" already exists (id ${dup[0]}) - delete it first, pick another name, or add ?replace=1 to overwrite it`, id: dup[0] });
+    }
+    if (dup) { try { fs.existsSync(dup[1].file) && fs.unlinkSync(dup[1].file); } catch {} deleteBlob('md-msg-' + dup[0]); delete messages[dup[0]]; addLog('msg', `named message "${name}" replaced (old id ${dup[0]})`); }
     const id = crypto.randomUUID().slice(0, 8);
     const file = path.join(MSG_DIR, `md-msg-${id}.wav`);
     try { fs.writeFileSync(file, audio); } catch (e) { return res.status(500).json({ error: e.message }); }

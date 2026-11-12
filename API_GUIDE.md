@@ -110,7 +110,7 @@ curl -X POST "$BASE/api/call" -H "Content-Type: application/json" -d '{
 | `members` | one of these | `[{number, name?, whoId?, attempt?, messageId?, messages?}]` - structured list (e.g. from Salesforce). The three optional fields pick the voicemail per record, see section 3c. |
 | `listId` | one of these | Id of a **saved list** (see `/api/list`). |
 | `concurrency` | no | Simultaneous calls, 1-10 (default 1). |
-| `messageId` | no | Which **named** voicemail to play; omit for the default/auto message. With per-record messages (3c) this is the **fallback**. |
+| `messageId` | no | Which uploaded voicemail to play: its **id or its exact name** (names are unique, case does not matter). `message` and `messageName` are accepted as aliases. Omit for the default/auto message. With per-record messages (3c) this is the **fallback**. Every other place that takes a message (`members[].messageId`, `members[].messages`, `attemptMessages`, `/api/records`, `busyMessageId`) accepts a name the same way. |
 | `attemptMessages` | no | `{"1": "<messageId or name>", "2": "..."}` - run-wide message per attempt number, for records that have none of their own. |
 | `humanAction` | no | `skip` (default) / `forward` / `sip` - what to do when a human answers. |
 | `humanForward` | if `forward` | Phone number to bridge live answers to. |
@@ -220,7 +220,7 @@ the UI encodes this client-side. Endpoints:
 
 | Call | What it does |
 |------|--------------|
-| `POST /api/message?name=Spring%20Campaign` (raw WAV bytes) | Store a **named** message. Returns `{ id, name, bytes }`. |
+| `POST /api/message?name=Spring%20Campaign` (raw WAV bytes) | Store a **named** message. Returns `{ id, name, bytes }`. Names are unique: uploading an existing name returns 409 unless you add `&replace=1`, which swaps the audio and keeps every reference by name working. |
 | `POST /api/message` (raw WAV bytes) | Replace the unnamed **default** message. |
 | `GET /api/messages` | List the default + all named messages. |
 | `DELETE /api/message/:id` | Delete a named message. |
